@@ -3,6 +3,7 @@ provider's response id, and the serving upstream when the route reports one. Exi
 prefix of the line, so the fields are appended and optional."""
 import logging
 from types import SimpleNamespace
+from unittest.mock import MagicMock
 
 
 def _agent(tmp_path, monkeypatch):
@@ -41,6 +42,24 @@ def test_write_id_and_upstream_are_on_the_line(tmp_path, monkeypatch, caplog):
     assert " upstream=Anthropic" in line
     # the pre-existing prefix is unchanged, so older parsers keep matching
     assert line.startswith("API call #1: model=anthropic/claude-fable-5.1 provider=nous in=62889 out=7 total=62896 latency=0.2s")
+
+
+def test_truthy_usage_without_prompt_tokens_uses_rough_fallback(tmp_path, monkeypatch, caplog):
+    a = _agent(tmp_path, monkeypatch)
+    a.context_compressor.note_usage_less_response = MagicMock()
+    try:
+        _line(
+            a,
+            caplog,
+            SimpleNamespace(
+                usage=SimpleNamespace(prompt_tokens=0, completion_tokens=7, total_tokens=7),
+                id="gen-output-only",
+                model="anthropic/claude-fable-5.1",
+            ),
+        )
+    finally:
+        a.close()
+    a.context_compressor.note_usage_less_response.assert_called_once_with()
 
 
 def test_fields_are_omitted_when_absent(tmp_path, monkeypatch, caplog):

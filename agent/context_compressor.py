@@ -4,6 +4,7 @@ tail are protected (iterative summaries, token-budget tail, tool-output pruning 
 import contextlib
 import contextvars
 import copy
+from decimal import Decimal
 import hashlib
 import json
 import logging
@@ -983,10 +984,6 @@ _PRESSURE_KEEP_RECENT_MESSAGES = 3
 # pass 2, so they ride every later request until anti-thrash disables compression (#92699).
 _MAX_KEEP_TOOL_IMAGES = 3
 
-# Below this window the threshold is floored (raise-only): at 50% the incompressible
-# floor eats the reclaimed headroom and compaction re-fires every 1-2 turns.
-_SMALL_CTX_WINDOW_LIMIT = 512_000
-_SMALL_CTX_THRESHOLD_PERCENT = 0.75
 
 
 _PATH_MENTION_RE = re.compile(r"(?:/|~/?|[A-Za-z]:\\)[^\s`'\")\]}<>]+")
@@ -1784,7 +1781,7 @@ class ContextCompressor(SummaryDispatchMixin, MicroCompactionMixin, ContextEngin
                 config_context_length=self._config_context_length, provider=self.provider,
                 custom_providers=self.custom_providers,
             )
-            # Raise-only small-context floor; must run after context_length resolves and before threshold_tokens derives.
+            # Derive the threshold from this model's resolved context window.
             self.threshold_percent = self._effective_threshold_percent(self._resolved_context_length, self._base_threshold_percent)
             self._emit_init_summary_once()
         return self._resolved_context_length
@@ -1799,7 +1796,7 @@ class ContextCompressor(SummaryDispatchMixin, MicroCompactionMixin, ContextEngin
         if value == getattr(self, "_resolved_context_length", None):
             return
         self._resolved_context_length = value
-        # Re-apply the raise-only floor so percent and tokens derive from the same window.
+        # Re-apply the configured ratio so percent and tokens derive from the same window.
         _base = getattr(self, "_base_threshold_percent", None)
         if _base is not None:
             self.threshold_percent = self._effective_threshold_percent(value, _base)
@@ -1809,7 +1806,7 @@ class ContextCompressor(SummaryDispatchMixin, MicroCompactionMixin, ContextEngin
     @property
     def threshold_tokens(self) -> int:
         if self._threshold_tokens is None:
-            # Resolve the window first: it may floor threshold_percent as a side effect.
+            # Resolve the window before deriving its model-relative threshold.
             _ctx = self.context_length
             self._threshold_tokens = self._compute_threshold_tokens(_ctx, self.threshold_percent, self.max_tokens)
             self._apply_threshold_tokens_cap()
@@ -2216,9 +2213,6 @@ class ContextCompressor(SummaryDispatchMixin, MicroCompactionMixin, ContextEngin
         self._reset_proactive_prune_rearm()
         self._clear_durable_proactive_prune_rearm()
 
-    # When the MINIMUM_CONTEXT_LENGTH floor binds on a small window, trigger near the top instead.
-    _MIN_CTX_TRIGGER_RATIO = 0.85
-
     # Anti-thrash recovery: after this long blocked, allow ONE probe (counters drop to 1 strike).
     # Anti-thrash recovery window (#14694): once the ineffective/fallback breaker trips, automatic
     # compaction stays blocked for this long, then ONE probe attempt is allowed (counters drop to 1 strike,
@@ -2251,50 +2245,40 @@ class ContextCompressor(SummaryDispatchMixin, MicroCompactionMixin, ContextEngin
 
     @staticmethod
     def _effective_threshold_percent(context_length: int, threshold_percent: float) -> float:
-        """Raise-only small-context threshold floor: models under 512K trigger at >= 75%."""
-        if context_length and context_length < _SMALL_CTX_WINDOW_LIMIT:
-            return max(threshold_percent, _SMALL_CTX_THRESHOLD_PERCENT)
+        """Use the configured ratio for every resolved model context window."""
         return threshold_percent
 
     @staticmethod
     def _compute_threshold_tokens(
         context_length: int, threshold_percent: float, max_tokens: int | None = None,
     ) -> int:
-        """Compute the compaction trigger in tokens from the effective input budget.
-        Base is ``(context_length - max_tokens) * threshold_percent`` floored at MINIMUM_CONTEXT_LENGTH;
-        when the floor binds it is capped at 85% of the budget so small windows can still fire.
+        """Compute the compaction trigger from the model's usable context budget.
 
-        The base value is ``effective_input_budget * threshold_percent``, floored at
-        ``MINIMUM_CONTEXT_LENGTH`` so large-context models don't compress prematurely at 50%. BUT that floor
-        degenerates at small windows: for a model whose ``context_length`` is at/below the minimum (e.g. a
-        64K local model), ``max(0.5*64000, 64000) == 64000`` makes the threshold equal the ENTIRE window —
-        auto-compression can never fire because the provider rejects the request before usage reaches 100%
-        (#14690).
-        The provider reserves ``max_tokens`` of output space out of the same window, so the usable INPUT
-        budget is ``context_length - max_tokens``. With a large ``max_tokens`` (e.g. 65536 on a custom
-        provider) the input budget is materially smaller than the raw window, and a threshold based on the
-        full window lets the session hit a provider 400 before compaction fires (#43547). The percentage and
-        the degenerate-window check below both operate on the effective input budget. ``max_tokens=None``
-        (provider default) conservatively assumes no reservation (full window).
+        ``max_tokens`` is reserved by providers for the response, so the input
+        budget is the model context window minus that reservation. The configured
+        ratio is applied directly to that budget. There is no model-size floor or
+        fixed token cap: a 70% policy must remain 70% for every model.
         """
         effective_window = context_length - (max_tokens or 0)
         if effective_window <= 0:
             effective_window = context_length
-        pct_value = int(effective_window * threshold_percent)
-        floored = max(pct_value, MINIMUM_CONTEXT_LENGTH)
-        # The floor must not consume output headroom: cap at 85% when it is the binding term. Near-minimum windows
-        # otherwise trigger at ~98%, and providers that silently clip over-window prompts (ollama) never raise the
-        # overflow backstop, so the session wedges. An explicit threshold_percent above 85% is user intent; not capped.
-        trigger_cap = int(effective_window * ContextCompressor._MIN_CTX_TRIGGER_RATIO)
-        if effective_window > 0 and floored > pct_value and floored > trigger_cap:
-            floored = max(pct_value, trigger_cap)
-        # A percentage at/above the window is unreachable; trigger at 85% instead.
-        if effective_window > 0 and floored >= effective_window:
-            return max(1, min(trigger_cap, effective_window - 1))
-        return floored
+        if effective_window <= 0:
+            return 1
+        try:
+            _ratio = Decimal(str(threshold_percent))
+        except (TypeError, ValueError):
+            _ratio = Decimal("0")
+        if not _ratio.is_finite():
+            _ratio = Decimal("0")
+        # Decimal(str(...)) avoids binary-float truncation (for example,
+        # 372_000 * 0.70 must produce exactly 260_400 before flooring).
+        threshold = int(Decimal(effective_window) * _ratio)
+        # A ratio of 100% would be unreachable. Keep that invalid-at-runtime
+        # edge safe without changing the configured 70% behavior.
+        return max(1, min(threshold, effective_window - 1))
 
     def __init__(
-        self, model: str, threshold_percent: float = 0.50, protect_first_n: int = 3, protect_last_n: int = 20,
+        self, model: str, threshold_percent: float = 0.70, protect_first_n: int = 3, protect_last_n: int = 20,
         summary_target_ratio: float = 0.20, quiet_mode: bool = False, summary_model_override: str = None,
         base_url: str = "", api_key: str = "", config_context_length: int | None = None, provider: str = "",
         api_mode: str = "", abort_on_summary_failure: bool = False, max_tokens: int | None = None,
@@ -2309,9 +2293,9 @@ class ContextCompressor(SummaryDispatchMixin, MicroCompactionMixin, ContextEngin
         # Per-model context_length overrides live in custom_providers; without them deferred
         # resolution falls back to the hardcoded family catalog (#83324).
         self.custom_providers = custom_providers or None
-        # Per-model overrides (longest substring match wins); floor applied on top.
+        # Per-model overrides (longest substring match wins).
         self.model_thresholds = model_thresholds or {}
-        # Raw config value, before override/floor; fallback when switching to a model with no override.
+        # Raw config value used when switching to a model with no override.
         self._config_threshold_percent = threshold_percent
         self._base_threshold_percent = resolve_model_threshold(model, self.model_thresholds, threshold_percent, provider)
         self.threshold_percent = self._base_threshold_percent
@@ -2357,12 +2341,8 @@ class ContextCompressor(SummaryDispatchMixin, MicroCompactionMixin, ContextEngin
         # Cadence dial: how often the cache-breaking pass is paid. 1 = every turn.
         self._micro_compact_every_n_turns: int = 1
         # Deferred: get_model_context_length() may issue a sync HTTP probe that must not block construction.
-        # Floor and cap are applied on first resolution (see _resolve_context_length / threshold_tokens).
-        # The small-context threshold floor and the absolute threshold cap both need the resolved window, so
-        # they are applied on first resolution (see _resolve_context_length / the threshold_tokens property)
-        # instead of here. update_model() re-derives the floor for a new window from
-        # _config_threshold_percent (the raw config value snapshotted above), so switching small -> large
-        # correctly drops back to the configured value. See #32221.
+        # Threshold and budget are applied on first context resolution (see
+        # _resolve_context_length / threshold_tokens).
         self._config_context_length = config_context_length
         self._configured_threshold_percent = self.threshold_percent
         self._resolved_context_length: int | None = None

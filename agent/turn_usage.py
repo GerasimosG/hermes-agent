@@ -116,6 +116,13 @@ def record_response_usage(
         getattr(compressor, "_verify_compaction_cleared_threshold", False)
     )
     compressor.update_from_response(usage_dict)
+    if prompt_tokens <= 0:
+        # Some providers return a truthy usage object containing only output
+        # fields. Treat that the same as a missing usage report so the next
+        # rough preflight is allowed to trigger compression.
+        _note_usage_less = getattr(compressor, "note_usage_less_response", None)
+        if callable(_note_usage_less):
+            _note_usage_less()
     # Usage-anchored accounting: snapshot exact provider usage against the durable
     # transcript (main-loop ONLY; MoA uses pre-fold aggregator usage). The display meter
     # anchors on the turn's FIRST response: later same-turn responses inflate

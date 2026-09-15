@@ -99,9 +99,9 @@ class TestSessionHygieneThresholds:
         history = _make_history(250, content_size=10)
         approx_tokens = estimate_messages_tokens_rough(history)
 
-        # 200k model at 85% = 170k token threshold
+        # 200k model at 70% = 140k token threshold
         context_length = 200_000
-        threshold_pct = 0.85
+        threshold_pct = 0.70
         compress_token_threshold = int(context_length * threshold_pct)
 
         needs_compress = approx_tokens >= compress_token_threshold
@@ -122,7 +122,7 @@ class TestSessionHygieneThresholds:
         approx_tokens = estimate_messages_tokens_rough(history)
 
         context_length = 200_000
-        threshold_pct = 0.85
+        threshold_pct = 0.70
         compress_token_threshold = int(context_length * threshold_pct)
 
         # Token-based check only
@@ -131,12 +131,12 @@ class TestSessionHygieneThresholds:
 
     def test_threshold_scales_with_model(self):
         """Different models should have different compression thresholds."""
-        # 128k model at 85% = 108,800 tokens
-        small_model_threshold = int(128_000 * 0.85)
-        # 200k model at 85% = 170,000 tokens
-        large_model_threshold = int(200_000 * 0.85)
-        # 1M model at 85% = 850,000 tokens
-        huge_model_threshold = int(1_000_000 * 0.85)
+        # 128k model at 70% = 89,600 tokens
+        small_model_threshold = int(128_000 * 0.70)
+        # 200k model at 70% = 140,000 tokens
+        large_model_threshold = int(200_000 * 0.70)
+        # 1M model at 70% = 700,000 tokens
+        huge_model_threshold = int(1_000_000 * 0.70)
 
         # A session at ~120k tokens:
         history = _make_large_history_tokens(120_000)
@@ -148,6 +148,52 @@ class TestSessionHygieneThresholds:
         assert approx_tokens < large_model_threshold
         # Should NOT trigger for 1M model
         assert approx_tokens < huge_model_threshold
+
+
+def test_gateway_reads_the_shared_compression_threshold():
+    """Gateway hygiene must use compression.threshold rather than a second ratio."""
+    from gateway.run import GatewayRunner
+
+    settings = GatewayRunner._HygieneSettings(
+        model="test/model",
+        threshold_pct=0.70,
+        compression_enabled=True,
+        hard_msg_limit=5000,
+        timeout_seconds=30.0,
+        total_ceiling_seconds=600.0,
+        max_turn_hold_seconds=10.0,
+        failure_cooldown_seconds=300.0,
+        config_context_length=None,
+        provider=None,
+        base_url=None,
+        api_key=None,
+        data={},
+    )
+    GatewayRunner._hmwa_hygiene_read_config(
+        settings,
+        {"compression": {"threshold": 0.70}},
+    )
+    assert settings.threshold_pct == 0.70
+    assert int(272_000 * settings.threshold_pct) == 190_400
+
+    GatewayRunner._hmwa_hygiene_read_config(
+        settings,
+        {"compression": {"threshold": 1.5}},
+    )
+    assert settings.threshold_pct == 0.70
+
+
+def test_hygiene_total_ceiling_warning_reports_elapsed_and_progress():
+    from gateway.run import _hygiene_compression_timeout_message
+
+    warning = _hygiene_compression_timeout_message(
+        total_exhausted=True, elapsed=600.4, idle_timeout=30.0, progress_observed=True,
+    )
+
+    assert "total ceiling after 600.4s" in warning
+    assert "summary output was observed" in warning
+    assert "30.0s" not in warning
+    assert "no output" not in warning
 
 
 @pytest.mark.parametrize("total_exhausted", [True, False])
@@ -187,17 +233,15 @@ class TestEstimatedTokenThreshold:
     """Verify that hygiene thresholds are always below the model's context
     limit — for both actual and estimated token counts.
 
-    Regression: a previous 1.4x multiplier on rough estimates pushed the
-    threshold to 85% * 1.4 = 119% of context, which exceeded the model's
-    limit and prevented hygiene from ever firing for ~200K models (GLM-5).
-    The fix removed the multiplier entirely — the 85% threshold already
-    provides ample headroom over the agent's 50% compressor.
+    Regression: a previous estimate multiplier pushed the threshold above
+    the model limit, preventing hygiene from firing for some models. The
+    shared 70% threshold is now applied directly to each resolved window.
     """
 
     def test_threshold_below_context_for_200k_model(self):
         """Hygiene threshold must always be below model context."""
         context_length = 200_000
-        threshold = int(context_length * 0.85)
+        threshold = int(context_length * 0.70)
         assert threshold < context_length
 
 
@@ -208,13 +252,12 @@ class TestEstimatedTokenThreshold:
         safe and harmless.
         """
         context_length = 200_000
-        threshold = int(context_length * 0.85)  # 170K
-        # If actual tokens = 113K, rough estimate = 113K * 1.5 = 170K
-        # Hygiene fires when estimate hits 170K, actual is ~113K = 57% of ctx
+        threshold = int(context_length * 0.70)  # 140K
+        # If actual tokens = 93K, rough estimate = 93K * 1.5 = 140K
+        # Hygiene fires when estimate hits 140K, actual is ~47% of ctx
         actual_when_fires = threshold / 1.5
-        assert actual_when_fires > context_length * 0.50, (
-            "Early fire should still be above agent's 50% threshold"
-        )
+        assert actual_when_fires < context_length * 0.70
+        assert actual_when_fires > context_length * 0.40
         assert actual_when_fires < context_length, (
             "Early fire must be well below model limit"
         )
@@ -493,12 +536,12 @@ async def test_session_hygiene_preserves_transcript_when_in_place_configured_but
 
 
 @pytest.mark.asyncio
-async def test_session_hygiene_timeout_continues_to_agent_and_sets_cooldown(monkeypatch, tmp_path):
+async def test_session_hygiene_timeout_defers_before_provider_request(monkeypatch, tmp_path):
     """A timed-out SessionDB-bound worker cannot compact after the live turn starts.
 
     The worker remains alive long enough to cross the old race window. The
-    timeout must fence its eventual commit, continue to the live agent, and
-    clean up the temporary agent only after the worker actually returns.
+    timeout fences its eventual commit and the gateway must defer the live
+    agent rather than send the original oversized transcript.
     """
     fake_dotenv = types.ModuleType("dotenv")
     fake_dotenv.load_dotenv = lambda *args, **kwargs: None
@@ -621,9 +664,9 @@ async def test_session_hygiene_timeout_continues_to_agent_and_sets_cooldown(monk
 
     result = await runner._handle_message(event)
 
-    assert result == "ok"
+    assert result.startswith("⚠️ Context compression did not complete")
     assert worker_started.is_set()
-    assert runner._run_agent.await_count == 1
+    assert runner._run_agent.await_count == 0
     # Cooldown must be persisted to the state DB (survives restart, #74136),
     # not stashed in an in-memory dict.
     assert fake_db.record_compression_failure_cooldown.called
@@ -659,9 +702,8 @@ async def test_session_hygiene_turn_hold_budget_abandons_streaming_wait(
     ticking the commit fence (touch_progress), so the per-slice inactivity
     timeout NEVER fires — without a turn-hold budget the gateway would extend
     the wait up to the total ceiling (default 600s) while zero bytes hit the
-    wire, severing the transport. The turn must instead be abandoned once it
-    exceeds ``hygiene_max_turn_hold_seconds``, proceed on the uncompressed
-    transcript, and fence the stale commit.
+    wire, and no provider request must be issued with the uncompressed
+    transcript. The stale commit is fenced so a later turn can retry safely.
     """
     fake_dotenv = types.ModuleType("dotenv")
     fake_dotenv.load_dotenv = lambda *args, **kwargs: None
@@ -790,12 +832,12 @@ async def test_session_hygiene_turn_hold_budget_abandons_streaming_wait(
     result = await asyncio.wait_for(runner._handle_message(event), timeout=15)
     elapsed = time.monotonic() - started
 
-    # The turn proceeded on the uncompressed transcript well under the 600s
-    # ceiling — the turn-hold budget (~0.3s) abandoned the streaming wait.
-    assert result == "ok"
+    # The turn is dropped after the deferral notice; the uncompressed transcript
+    # must never reach the provider.
+    assert result is None
     assert elapsed < 5.0, f"turn held for {elapsed:.1f}s despite the turn-hold budget"
     assert worker_started.is_set()
-    assert runner._run_agent.await_count == 1
+    assert runner._run_agent.await_count == 0
     # The stale commit must be fenced: the late worker never mutates the session.
     fake_db.archive_and_compact.assert_not_called()
 
@@ -888,8 +930,11 @@ async def test_session_hygiene_idle_timeout_still_takes_failure_path(
         ):
             worker_started.set()
             # NEVER touch progress — the inactivity slice will fire.
-            # But we must be stoppable so the test can clean up.
+            # Respect the commit fence so timeout cleanup can finish without a
+            # second test-controlled release event.
             while not release_worker.is_set():
+                if commit_fence is not None and commit_fence.is_cancelled:
+                    return messages
                 time.sleep(0.01)
 
     fake_run_agent = types.ModuleType("run_agent")
@@ -968,12 +1013,11 @@ async def test_session_hygiene_idle_timeout_still_takes_failure_path(
     result = await asyncio.wait_for(runner._handle_message(event), timeout=15)
     elapsed = time.monotonic() - started
 
-    # The turn proceeded on the uncompressed transcript after the idle
-    # timeout fired (~0.1s).
-    assert result == "ok"
+    # The turn is deferred instead of proceeding with an oversized transcript.
+    assert result.startswith("⚠️ Context compression did not complete")
     assert elapsed < 5.0
     assert worker_started.is_set()
-    assert runner._run_agent.await_count == 1
+    assert runner._run_agent.await_count == 0
 
     # Behavior witness: idle timeout MUST send the idle-timeout message (with the `hermes doctor` pointer).
     sent_contents = [m["content"] for m in adapter.sent]
@@ -1703,13 +1747,13 @@ async def test_hygiene_does_not_wait_ceiling_after_fence_cancel(
         result = await runner._handle_message(event)
         elapsed = time.monotonic() - started
 
-        assert result == "ok"
+        assert result.startswith("⚠️ Context compression did not complete")
         assert worker_started.wait(timeout=2)
         assert elapsed < 2.0, (
             f"hygiene host waited {elapsed:.1f}s after fence cancel — "
             "must not extend toward the 600s ceiling (#96953)"
         )
-        assert runner._run_agent.await_count == 1
+        assert runner._run_agent.await_count == 0
         state = db.get_compression_failure_cooldown(session_id)
         assert state is not None and state["remaining_seconds"] > 0
         assert not any(
