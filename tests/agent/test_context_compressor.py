@@ -395,41 +395,17 @@ class TestCompress:
             f"#49307), found {count}x:\n{summary}"
         )
 
-    def test_threshold_below_window_at_minimum_ctx(self):
-        """Regression for #14690: at context_length == MINIMUM_CONTEXT_LENGTH
-        the floored threshold used to equal the whole window, so
-        auto-compression could never fire. It now triggers at 85% of the
-        window — high enough not to waste the small budget, below 100% so it
-        actually fires."""
+    def test_threshold_is_70_percent_at_minimum_context_window(self):
+        """The configured ratio remains 70% even for the smallest model window."""
         from agent.context_compressor import MINIMUM_CONTEXT_LENGTH
-        t = ContextCompressor._compute_threshold_tokens(MINIMUM_CONTEXT_LENGTH, 0.50)
-        assert t < MINIMUM_CONTEXT_LENGTH
-        assert t == 54400  # 85% of 64000
+        t = ContextCompressor._compute_threshold_tokens(MINIMUM_CONTEXT_LENGTH, 0.70)
+        assert t == int(MINIMUM_CONTEXT_LENGTH * 0.70)
 
-    def test_threshold_floor_capped_at_85_percent_of_window(self):
-        """The MINIMUM_CONTEXT_LENGTH floor must not consume the window's
-        output headroom. At context_length == 65,536 (a common local-model
-        window) the floored threshold used to pass through at 64,000 — 97.7%
-        of the window, ~1.5K tokens of output room — so pre-API compaction
-        effectively could not fire. Providers that silently truncate
-        over-window prompts instead of rejecting them (e.g. ollama's
-        OpenAI-compatible endpoint) never delivered the reactive
-        context-overflow backstop either: a live session rode into the window
-        ceiling and each length-continuation retry re-sent a window-filling
-        prompt (observed 65,120 -> 65,273 prompt tokens against 65,536,
-        leaving 263 output tokens) until the turn died with "Response
-        remained truncated after 4 continuation attempts". The floor is now
-        capped at 85% of the effective input budget whenever it is the
-        binding term."""
-        t = ContextCompressor._compute_threshold_tokens(65_536, 0.50)
-        assert t == int(65_536 * 0.85)  # 55,705
-        # Any window where the floor lands above 85% is capped the same way.
-        assert ContextCompressor._compute_threshold_tokens(70_000, 0.50) == 59_500
-        # Floor binding but at/under the 85% cap: unchanged.
-        assert ContextCompressor._compute_threshold_tokens(100_000, 0.50) == 64_000
-        # An explicit threshold_percent above 85% is user intent, not the
-        # floor — it is not capped.
-        assert ContextCompressor._compute_threshold_tokens(372_000, 0.90) == 334_800
+    def test_threshold_is_70_percent_for_small_windows_without_floor(self):
+        """Small windows no longer receive a hidden 75% or 85% adjustment."""
+        assert ContextCompressor._compute_threshold_tokens(65_536, 0.70) == 45_875
+        assert ContextCompressor._compute_threshold_tokens(100_000, 0.70) == 70_000
+        assert ContextCompressor._compute_threshold_tokens(372_000, 0.70) == 260_400
 
 
 
@@ -1833,14 +1809,24 @@ class TestSummaryTargetRatio:
 
 
 
-    def test_default_threshold_floored_at_75_percent_below_512k(self):
-        """Sub-512K models get the 75% small-context threshold floor."""
+    def test_default_threshold_is_70_percent_of_each_model_window(self):
+        """The default policy uses 70% of the resolved model context window."""
         with patch("agent.context_compressor.get_model_context_length", return_value=100_000):
             c = ContextCompressor(model="test", quiet_mode=True)
             _ = c.context_length
-        assert c.threshold_percent == 0.75
-        # 75% of 100K = 75K, above the 64K minimum floor
-        assert c.threshold_tokens == 75_000
+        assert c.threshold_percent == 0.70
+        assert c.threshold_tokens == 70_000
+
+    @pytest.mark.parametrize(
+        ("context_length", "expected_threshold"),
+        [(128_000, 89_600), (272_000, 190_400), (1_000_000, 700_000)],
+    )
+    def test_configured_threshold_scales_with_model_window(self, context_length, expected_threshold):
+        """The same 70% ratio yields a different token trigger per model."""
+        with patch("agent.context_compressor.get_model_context_length", return_value=context_length):
+            c = ContextCompressor(model="test", threshold_percent=0.70, quiet_mode=True)
+            _ = c.context_length
+        assert c.threshold_tokens == expected_threshold
 
 
 
@@ -2256,6 +2242,7 @@ class TestThresholdTokensCap:
         with patch("agent.context_compressor.get_model_context_length", return_value=1_000_000):
             comp = ContextCompressor(
                 "model-a", threshold_percent=0.50, quiet_mode=True,
+                config_context_length=1_000_000,
                 threshold_tokens_cap=200_000,
             )
         # Ratio-based would be 500K; cap pulls the trigger down to 200K.
@@ -3406,9 +3393,8 @@ class TestMinTailUserMessages:
 class TestContextLengthSetterCoherence:
     """The context_length setter must (a) not wipe runtime corrections on
     no-op re-assignment of the same window (codex app-server usage callback
-    re-reports it every response), and (b) re-apply the small-context
-    threshold floor for a genuinely new window so percent and tokens derive
-    from the same window."""
+    re-reports it every response), and (b) recompute the 70% threshold for a
+    genuinely new window so percent and tokens derive from the same window."""
 
     def test_same_value_reassignment_preserves_threshold_override(self):
         with patch("agent.context_compressor.get_model_context_length", return_value=200_000):
@@ -3426,13 +3412,13 @@ class TestContextLengthSetterCoherence:
         with patch("agent.context_compressor.get_model_context_length", return_value=1_000_000):
             c = ContextCompressor(model="test", quiet_mode=True)
             _ = c.context_length
-        assert c.threshold_percent == 0.50  # 1M >= 512K: configured value
-        # Switch to a small window via direct assignment (codex path).
+        assert c.threshold_percent == 0.70  # configured default applies to large windows
+        # Switch to a smaller window via direct assignment (codex path).
         c.context_length = 200_000
-        # Floor re-applied for the new window...
-        assert c.threshold_percent == 0.75
-        # ...and budgets recompute from the same window+percent.
-        assert c.threshold_tokens == 150_000
+        # The same ratio is re-applied for the new window.
+        assert c.threshold_percent == 0.70
+        # Budgets recompute from the same window and percent.
+        assert c.threshold_tokens == 140_000
 
 
 
