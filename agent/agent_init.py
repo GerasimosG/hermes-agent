@@ -1369,33 +1369,18 @@ def _positive_int(raw: Any, *, reject: tuple = ()) -> Optional[int]:
 
 
 def _compression_threshold(agent, cfg: Dict[str, Any]) -> tuple[float, bool]:
-    """Global threshold merged with the per-model override; stashes the autoraise notice.
-    Codex gpt-5.4/5.5 raise to 85% (272K cap → 50% would compact at ~136K); the opt-out flag
-    restores the global value, and the notice has its own display gate."""
-    threshold = float(cfg.get("threshold", 0.50))
-    autoraise = _cfg_flag(cfg, "codex_gpt55_autoraise", True)
+    """Read the configured model-relative compression ratio.
+
+    Automatic model/route-specific raises are intentionally not applied here:
+    server-side compression starts at the same configured ratio for every
+    resolved context window. Explicit ``model_thresholds`` entries remain the
+    supported escape hatch and are resolved by ``ContextCompressor``.
+    """
+    threshold = float(cfg.get("threshold", 0.70))
     notice_enabled = _cfg_flag(cfg, "codex_gpt55_autoraise_notice", True)
+    # Retain the attribute for compatibility with status/notice consumers. No
+    # automatic raise is produced under the universal model-relative policy.
     agent._compression_threshold_autoraised = None
-    with suppress(Exception):
-        from agent.auxiliary_client import (
-            _compression_threshold_for_model as _cthresh_fn,
-            _is_codex_gpt54_or_gpt55 as _is_codex_gpt54_or_gpt55_fn,
-            _is_codex_spark as _is_codex_spark_fn,
-        )
-        _model_cthresh = _cthresh_fn(
-            agent.model, agent.provider, allow_codex_gpt55_autoraise=autoraise,
-        )
-        # Codex autoraises apply only when they RAISE; Arcee Trinity keeps its
-        # unconditional override.
-        threshold, agent._compression_threshold_autoraised = _resolve_compression_threshold(
-            threshold,
-            _model_cthresh,
-            model=agent.model,
-            is_codex_autoraise=(
-                _is_codex_gpt54_or_gpt55_fn(agent.model, agent.provider)
-                or _is_codex_spark_fn(agent.model, agent.provider)
-            ),
-        )
     return threshold, notice_enabled
 
 

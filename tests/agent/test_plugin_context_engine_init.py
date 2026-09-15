@@ -153,17 +153,12 @@ def _codex_agent_kwargs():
     )
 
 
-def test_codex_gpt55_autoraise_suppressed_for_plugin_engine():
-    """Codex gpt-5.5 autoraise must not fire when an external engine is active.
-
-    Regression test for #44439 — the host compression threshold (including
-    the 0.85 autoraise) never reaches a plugin context engine, so the notice
-    announced a change that did not apply.
-    """
+def test_plugin_engine_uses_configured_threshold():
+    """The host keeps the universal 70% policy when an external engine is active."""
     engine = _StubEngine()
     cfg = {
         "context": {"engine": "stub"},
-        "compression": {"enabled": True, "threshold": 0.75},
+        "compression": {"enabled": True, "threshold": 0.70},
         "agent": {},
     }
 
@@ -183,13 +178,13 @@ def test_codex_gpt55_autoraise_suppressed_for_plugin_engine():
     assert agent._compression_threshold_autoraised is None
     assert agent._compression_warning is None
     # The engine's own policy is untouched by the host threshold.
-    assert engine.threshold_percent == 0.75
+    assert engine.threshold_percent == 0.70
 
 
-def test_codex_gpt55_autoraise_still_applies_to_builtin_compressor():
-    """Stock built-in compressor keeps the 50% → 85% Codex gpt-5.5 autoraise."""
+def test_builtin_compressor_uses_universal_model_relative_threshold():
+    """The built-in compressor starts at the configured 70% ratio."""
     cfg = {
-        "compression": {"enabled": True, "threshold": 0.50},
+        "compression": {"enabled": True, "threshold": 0.70},
         "agent": {},
     }
 
@@ -204,9 +199,8 @@ def test_codex_gpt55_autoraise_still_applies_to_builtin_compressor():
 
         agent = AIAgent(**_codex_agent_kwargs())
 
-    assert agent._compression_threshold_autoraised == {"model": "gpt-5.5", "from": 0.50, "to": 0.85}
-    assert agent.context_compressor.threshold_percent == 0.85
-    # Gateway parity: the notice is stashed for replay on turn 1.
-    assert agent._compression_warning and "85%" in agent._compression_warning
-
+    assert agent._compression_threshold_autoraised is None
+    assert agent.context_compressor.threshold_percent == 0.70
+    assert agent.context_compressor.threshold_tokens == int(272_000 * 0.70)
+    assert agent._compression_warning is None
 

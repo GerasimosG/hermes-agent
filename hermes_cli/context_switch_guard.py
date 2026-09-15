@@ -4,7 +4,6 @@ from __future__ import annotations
 
 from typing import Any, Callable, List, Optional
 
-from agent.model_metadata import MINIMUM_CONTEXT_LENGTH
 from hermes_cli.model_switch import ModelSwitchResult, resolve_display_context_length
 
 
@@ -16,7 +15,7 @@ def _append_warning(result: ModelSwitchResult, text: str) -> None:
 
 
 def _threshold_tokens(context_length: int, threshold_percent: float) -> int:
-    return max(int(context_length * threshold_percent), MINIMUM_CONTEXT_LENGTH)
+    return max(int(context_length * threshold_percent), 1)
 
 
 def _estimate_tokens(agent: Any, messages: Optional[List[dict]]) -> Optional[int]:
@@ -94,7 +93,7 @@ def merge_preflight_compression_warning(
     if estimate is None:
         return
 
-    new_threshold = _threshold_tokens(new_ctx, float(getattr(cc, "threshold_percent", 0.5)))
+    new_threshold = _threshold_tokens(new_ctx, float(getattr(cc, "threshold_percent", 0.70)))
     if estimate < new_threshold:
         return
 

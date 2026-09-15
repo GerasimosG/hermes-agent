@@ -3,8 +3,9 @@
 Users who swap between models with very different context windows (e.g. a
 256K model and a 1M model) need different compaction trigger points.
 ``compression.model_thresholds`` in config.yaml lets them set per-model
-overrides that are resolved by longest substring match. The small-context
-floor (75% for <512K models) still applies on top of per-model overrides.
+overrides that are resolved by longest substring match. The small-context floor
+is not applied; each explicit override is used as provided, while the default
+global ratio is 70%.
 """
 
 from unittest.mock import patch
@@ -39,14 +40,14 @@ class TestResolveModelThreshold:
 class TestContextCompressorModelThresholds:
     @patch("agent.context_compressor.get_model_context_length", return_value=1_000_000)
     def test_init_large_context_with_override(self, _mock):
-        """Large context (>=512K) + per-model override: override applies directly."""
+        """A per-model override applies directly."""
         cc = ContextCompressor(
             model="glm-5.2",
             threshold_percent=0.50,
             model_thresholds={"glm-5.2": 0.40},
             quiet_mode=True,
         )
-        # 1M context >= 512K, so no small-context floor — override wins
+        # The explicit per-model override wins.
         assert cc.threshold_percent == 0.40
         assert cc.threshold_tokens == int(1_000_000 * 0.40)
 
@@ -61,16 +62,16 @@ class TestContextCompressorModelThresholds:
             threshold_percent=0.50,
             quiet_mode=True,
         )
-        # Resolve while mock is active (lazy init defers floor past __init__).
+        # Resolve while mock is active; lazy init defers the context probe.
         _ = cc.context_length
-        # 256K < 512K → floored at 0.75
-        assert cc.threshold_percent == 0.75
+        # 256K keeps the explicitly configured 50% ratio; no automatic floor.
+        assert cc.threshold_percent == 0.50
         assert cc.model_thresholds == {}
 
 
     @patch("agent.context_compressor.get_model_context_length")
     def test_update_model_re_resolves_threshold(self, mock_ctx):
-        """Switching models re-resolves the per-model threshold + re-applies floor."""
+        """Switching models re-resolves the per-model threshold without a floor."""
         mock_ctx.return_value = 256_000
         cc = ContextCompressor(
             model="glm-5.2",
@@ -78,16 +79,16 @@ class TestContextCompressorModelThresholds:
             model_thresholds={"glm-5.2": 0.80, "glm-5.2-1M": 0.25},
             quiet_mode=True,
         )
-        # 256K < 512K → floor at 0.75; override 0.80 > 0.75, so 0.80 wins
+        # 256K uses the explicit 0.80 override directly.
         assert cc.threshold_percent == 0.80
 
-        # Switch to the 1M model (large context, no floor)
+        # Switch to the 1M model.
         mock_ctx.return_value = 1_000_000
         cc.update_model(
             model="glm-5.2-1M",
             context_length=1_000_000,
         )
-        # 1M >= 512K → no floor; override 0.25 applies directly
+        # 1M uses the explicit 0.25 override directly.
         assert cc.threshold_percent == 0.25
         assert cc.threshold_tokens == int(1_000_000 * 0.25)
 

@@ -38,25 +38,16 @@ def _compressor_ctor_default(name: str, fallback: Any) -> Any:
 
 
 def _derived_default_threshold_percent(agent: Any, compression: dict) -> float:
-    """Default compaction threshold when ``compression.threshold`` is unset. Mirrors agent_init: ctor
-    global default, then per-model resolution (Codex autoraise etc.) via the SAME
-    ``_resolve_compression_threshold`` — removing the key restores the model-derived value."""
+    """Return the constructor's universal model-relative threshold default.
+
+    Model-specific policies are applied only when the user explicitly supplies
+    ``compression.model_thresholds``. Removing ``compression.threshold`` must
+    therefore restore the same 70% default as a newly constructed compressor.
+    """
     try:
-        pct = float(_compressor_ctor_default("threshold_percent", 0.50))
+        return float(_compressor_ctor_default("threshold_percent", 0.70))
     except (TypeError, ValueError):
-        pct = 0.50
-    try:
-        from agent.agent_init import _resolve_compression_threshold
-        from agent.auxiliary_client import _compression_threshold_for_model, _is_codex_gpt54_or_gpt55, _is_codex_spark
-        model, provider = getattr(agent, "model", "") or "", getattr(agent, "provider", "") or ""
-        autoraise_enabled = str(compression.get("codex_gpt55_autoraise", True)).lower() in {"true", "1", "yes"}
-        pct, _notice = _resolve_compression_threshold(
-            pct, _compression_threshold_for_model(model, provider, allow_codex_gpt55_autoraise=autoraise_enabled),
-            model=model, is_codex_autoraise=_is_codex_gpt54_or_gpt55(model, provider) or _is_codex_spark(model, provider),
-        )
-    except Exception:
-        pass
-    return pct
+        return 0.70
 
 
 # (config key == compressor attr, ctor-default fallback, min_value)
@@ -74,11 +65,9 @@ def _apply_live_compression_config(agent: Any, cfg: dict | None) -> None:
     a removed key restores the normalized default (or model-derived value) through the construction
     path's own derivation — acting only on PRESENT keys would leave stale values active forever.
 
-    Every adopted key has UNSET semantics (#94724 review finding on the merged #95980): removing a key from
-    config.yaml restores the normalized default — or the model-derived value — on the next turn, through the
-    same derivation the construction path uses (ContextCompressor ctor defaults read off its real signature,
-    the Codex threshold autoraise via ``_resolve_compression_threshold``, context-length re-inference via
-    the deferred ``get_model_context_length`` resolution).
+    The local compressor threshold remains authoritative for native compaction when no explicit
+    ``codex_responses_compact_threshold`` is configured, so the native request inherits the same
+    70%-of-active-context boundary.
     """
     cfg = cfg if isinstance(cfg, dict) else {}
     compression = cfg.get("compression") if isinstance(cfg.get("compression"), dict) else {}
@@ -86,13 +75,18 @@ def _apply_live_compression_config(agent: Any, cfg: dict | None) -> None:
     enabled_raw = compression.get("enabled", True)
     agent.compression_enabled = enabled_raw if isinstance(enabled_raw, bool) else str(enabled_raw).lower() in {"true", "1", "yes"}
     agent.codex_responses_native_compaction = is_truthy_value(compression.get("codex_responses_native", False))
-    native_threshold_raw = compression.get("codex_responses_compact_threshold", 200_000)
-    try:
-        if isinstance(native_threshold_raw, bool) or (native_threshold := int(native_threshold_raw)) <= 0:
-            raise ValueError
-    except (TypeError, ValueError):
-        logger.warning("Invalid compression.codex_responses_compact_threshold=%r; using 200000.", native_threshold_raw)
-        native_threshold = 200_000
+    native_threshold_raw = compression.get("codex_responses_compact_threshold")
+    native_threshold = None
+    if native_threshold_raw is not None:
+        try:
+            if isinstance(native_threshold_raw, bool) or (native_threshold := int(native_threshold_raw)) <= 0:
+                raise ValueError
+        except (TypeError, ValueError):
+            logger.warning(
+                "Invalid compression.codex_responses_compact_threshold=%r; leaving the local 70%% trigger authoritative.",
+                native_threshold_raw,
+            )
+            native_threshold = None
     agent.codex_responses_compact_threshold = native_threshold
     # Absence restores the agent_init/config default (0 = disabled).
     with contextlib.suppress(TypeError, ValueError):
@@ -117,8 +111,8 @@ def _apply_live_compression_config(agent: Any, cfg: dict | None) -> None:
     cc.model_thresholds = {
         str(k): float(v) for k, v in raw_thresholds.items() if isinstance(v, (int, float)) and not isinstance(v, bool)
     } if isinstance(raw_thresholds, dict) else {}
-    # threshold: present value wins; absence derives via the agent_init resolution (default + autoraise).
-    # resolve_model_threshold returns ``pct`` unchanged when model_thresholds is empty.
+    # threshold: present value wins; absence restores the universal model-relative default.
+    # resolve_model_threshold applies only explicit model_thresholds entries.
     from agent.context_compressor import resolve_model_threshold
     pct: float | None = None
     if "threshold" in compression:
@@ -143,7 +137,7 @@ def _apply_live_compression_config(agent: Any, cfg: dict | None) -> None:
                     cc.context_length = new_ctx
     elif getattr(cc, "_config_context_length", None) is not None:
         # model.context_length removed: drop the override and force re-inference from model metadata on
-        # next access (construction's deferred resolution); re-applies the small-context floor too.
+        # next access (construction's deferred resolution); re-applies the model-relative ratio too.
         cc._config_context_length = cc._resolved_context_length = None
     cc.threshold_tokens_cap = cc._coerce_threshold_tokens_cap(compression.get("threshold_tokens"))
     # Invalidate the cached trigger so the next preflight re-derives from percent/window, then the cap.
