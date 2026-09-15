@@ -568,3 +568,22 @@ class TestBridgeDispatch:
             out = handle_function_call("tool_call", {"name": "mcp_x"}, task_id="t")
         assert json.loads(out) == {"ok": True}
         assert disp.call_args.args[0] == "mcp_x" and disp.call_args.args[1] == {"a": 1}
+
+
+def test_tool_defs_cache_key_sees_config_replacement_with_pinned_mtime(tmp_path):
+    """#111105: a same-size config.yaml swapped in with the old mtime must change the memo key."""
+    import os
+    import shutil
+
+    from model_tools import _tool_defs_cache_key
+
+    cfg = tmp_path / "config.yaml"
+    cfg.write_text("mcp_servers:\n  aa: {command: a}\n", encoding="utf-8")
+    with patch("hermes_cli.config.get_config_path", return_value=cfg):
+        before = _tool_defs_cache_key(None, None, False)
+        st = cfg.stat()
+        other = tmp_path / "other.yaml"
+        other.write_text("mcp_servers:\n  bb: {command: b}\n", encoding="utf-8")
+        shutil.copy2(other, cfg)
+        os.utime(cfg, ns=(st.st_atime_ns, st.st_mtime_ns))
+        assert _tool_defs_cache_key(None, None, False) != before
