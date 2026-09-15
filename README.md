@@ -30,6 +30,8 @@ Use any model you want — [Nous Portal](https://portal.nousresearch.com), OpenR
 <tr><td><b>Research-ready</b></td><td>Batch trajectory generation, trajectory compression for training the next generation of tool-calling models.</td></tr>
 </table>
 
+The Desktop UI also uses Hermes' server-side context policy: when the active model's context window is resolved, compression starts at 70% of that window. The gateway shares the same ratio, so a fixed absolute token threshold is not required for model switches.
+
 ---
 
 ## Quick Install

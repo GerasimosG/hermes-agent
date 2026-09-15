@@ -43,6 +43,12 @@ if TYPE_CHECKING:  # string annotations only; never imported at runtime (cycle)
 # Log-record parity with the origin module.
 logger = logging.getLogger("gateway.run")
 
+# Returned by pre-agent session hygiene when compression was required but did not
+# produce a safe transcript. The caller must not send the original oversized
+# history to a provider.
+_HYGIENE_COMPRESSION_REQUIRED = object()
+_HYGIENE_COMPRESSION_NOTICE_SENT = object()
+
 
 _CONTEXT_OVERFLOW_ERROR_PHRASES = (
     "context length", "context size", "context window",
@@ -534,10 +540,16 @@ class GatewayTurnMixin:
             hs.provider = _model_cfg.get("provider") or None
             hs.base_url = _model_cfg.get("base_url") or None
 
-        # Only the enabled flag is shared with the agent's compression config (hygiene runs higher).
+        # Resolve the same ratio as the agent's model-aware compressor. The
+        # threshold is applied to the context window resolved for this turn.
         _comp_cfg = data.get("compression", {})
         if not isinstance(_comp_cfg, dict):
             return
+        _raw_threshold = _comp_cfg.get("threshold")
+        if isinstance(_raw_threshold, (int, float)) and not isinstance(_raw_threshold, bool):
+            _threshold = float(_raw_threshold)
+            if 0.0 < _threshold <= 1.0:
+                hs.threshold_pct = _threshold
         hs.compression_enabled = str(_comp_cfg.get("enabled", True)).lower() in {"true", "1", "yes"}
 
         def _knob(key, current, cast, allow_zero=False):
@@ -563,12 +575,12 @@ class GatewayTurnMixin:
     async def _hmwa_hygiene_settings(self, source, session_key):
         """Resolve model/provider/context-length + hygiene knobs (fail-soft: errors keep defaults).
 
-        The 0.85 threshold is deliberately HIGHER than the agent's compressor (0.50): a safety net
-        for sessions that grew between turns. ``max_turn_hold_seconds`` bounds the TURN wait
-        (compressor keeps running detached, commit fenced); kept below transport idle-timeouts."""
+        The threshold is shared with the agent compressor and is resolved
+        against the model context window for each inbound turn. ``max_turn_hold_seconds``
+        bounds the TURN wait while the compressor can continue detached."""
         from gateway.run import _load_gateway_config
         hs = self._HygieneSettings(
-            model="anthropic/claude-sonnet-4.6", threshold_pct=0.85, compression_enabled=True,
+            model="anthropic/claude-sonnet-4.6", threshold_pct=0.70, compression_enabled=True,
             hard_msg_limit=5000, timeout_seconds=30.0, total_ceiling_seconds=600.0,
             max_turn_hold_seconds=10.0, failure_cooldown_seconds=300.0, config_context_length=None,
             provider=None, base_url=None, api_key=None, data={},
@@ -811,10 +823,9 @@ class GatewayTurnMixin:
 
         Turn-hold expiry is an availability boundary, not a failure: the streak must NOT advance,
         only flat retry spacing is recorded. A watermark-fenced commit (rows appended after
-        compression start survive as cloned tail) KEEPS admission: the turn proceeds uncompressed
-        now and the summary is adopted at the worker's fenced commit — always cancelling burned
-        every attempt for thinking summary models. Without the fence a late commit could clobber
-        newer turns, so cancel."""
+        compression start survive as cloned tail) KEEPS admission so the summary can be adopted
+        asynchronously; the current turn is deferred and never sent with the original oversized
+        history. Without the fence a late commit could clobber newer turns, so cancel."""
         from gateway.run import (
             _HYGIENE_TURNHOLD_RETRY_SECONDS, _record_hygiene_cooldown, _reset_hygiene_failure_streak
         )
@@ -878,7 +889,7 @@ class GatewayTurnMixin:
         )
         logger.info(
             "Session hygiene compression for session %s exceeded turn-hold budget (%.1fs); "
-            "proceeding without compression this turn%s",
+            "deferring this turn without a provider request%s",
             session_entry.session_id, time.monotonic() - attempt.wait_started, _log_suffix,
         )
         await self._hmwa_hygiene_notify(
@@ -920,20 +931,20 @@ class GatewayTurnMixin:
         if _hyg_fence_cancelled:
             logger.warning(
                 "Session hygiene compression for session %s was cancelled at the "
-                "commit fence; continuing without compression", session_entry.session_id,
+                "commit fence; deferring without a provider request", session_entry.session_id,
             )
             raise
         _hyg_elapsed = time.monotonic() - attempt.wait_started
         if _hyg_total_exhausted:
             logger.warning(
                 "Session hygiene compression for session %s reached its total ceiling after "
-                "%.1fs (progress observed=%s); continuing without compression",
+                "%.1fs (progress observed=%s); deferring without a provider request",
                 session_entry.session_id, _hyg_elapsed, fence.progress_observed,
             )
         else:
             logger.warning(
                 "Session hygiene compression for session %s made no progress for %.1fs "
-                "(total wait %.1fs, ceiling %.1fs); continuing without compression",
+                "(total wait %.1fs, ceiling %.1fs); deferring without a provider request",
                 session_entry.session_id, fence.seconds_since_progress(), _hyg_elapsed, hs.total_ceiling_seconds,
             )
         await self._hmwa_hygiene_notify(
@@ -1261,12 +1272,13 @@ class GatewayTurnMixin:
                         source, session_entry, session_key, _quick_key, run_generation,
                     )
         except HygieneTurnHoldExceeded:
-            # Availability boundary, not a failure — already logged at INFO by the turn-hold handler.
-            # Must not hit the generic "auto-compress failed" warning below: that log is how thinking-model
-            # deployments read as permanently broken (#97963; surfaced by @686f6c61 in PR #99657).
-            pass
+            # The handler has already sent a deferral notice. Do not return the
+            # original history: the next provider request must see compressed
+            # or retried context.
+            return _HYGIENE_COMPRESSION_NOTICE_SENT
         except Exception as e:
             logger.warning("Session hygiene auto-compress failed: %s", e)
+            return _HYGIENE_COMPRESSION_REQUIRED
         return attempt.history
 
     async def _hmwa_first_contact_notes(self, source, history, turn_sidecar_notes):
@@ -1950,6 +1962,18 @@ class GatewayTurnMixin:
             history = await self._hmwa_run_session_hygiene(
                 event, source, session_entry, session_key, history, _quick_key, run_generation,
             )
+            if history is _HYGIENE_COMPRESSION_NOTICE_SENT:
+                # The hygiene handler already delivered the deferral notice;
+                # drop this turn instead of sending the original oversized history.
+                self._clear_session_env(_session_env_tokens)
+                return None, _session_env_tokens
+            if history is _HYGIENE_COMPRESSION_REQUIRED:
+                self._clear_session_env(_session_env_tokens)
+                return (
+                    "⚠️ Context compression did not complete, so this message was not sent to the model. "
+                    "Please retry once the session has been compressed.",
+                    _session_env_tokens,
+                )
         except TranscriptReadError:
             self._clear_session_env(_session_env_tokens)
             return (

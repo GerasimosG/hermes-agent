@@ -530,10 +530,9 @@ DEFAULT_CONFIG = {
         # preflight/pre-API/idle/retry) reach chat gateways instead of being filtered as noise.
         # Failure notices and manual /compress feedback are always visible.
         "progress_notices": False,
-        # threshold: compress when context usage exceeds this ratio. Models with windows below 512K
-        # are floored at 0.75 (raise-only) so compaction doesn't fire with half the window free; set
-        # above 0.75 to override the floor.
-        "threshold": 0.50,
+        # threshold: compress when context usage reaches this ratio of each model's usable context window.
+        # The gateway and local compressor apply this same model-aware value; no size-based floor is used.
+        "threshold": 0.70,
         # threshold_tokens: absolute token cap — compression triggers at the lower of the ratio
         # threshold and this count. Clamped to the model's context length.
         "threshold_tokens": None,
