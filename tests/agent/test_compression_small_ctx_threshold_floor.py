@@ -8,8 +8,8 @@ Covers the July 2026 compression tuning pass:
    summarizer model must never be stored in the summary.
 2. Head/tail protection budgets stay proportionate (tail = 20% of threshold).
 3. Summary token budget is bounded to the 1K-10K envelope.
-4. Models with context windows below 512K get their compression threshold
-   floored at 75% (raise-only — a higher configured value always wins).
+4. Every context window uses the configured ratio directly; the default policy
+   is 70% and no automatic small-context floor is applied.
 """
 
 from unittest.mock import patch
@@ -18,7 +18,7 @@ import agent.context_compressor as cc
 from agent.context_compressor import ContextCompressor
 
 
-def _make(ctx: int, pct: float = 0.50) -> ContextCompressor:
+def _make(ctx: int, pct: float = 0.70) -> ContextCompressor:
     with patch.object(cc, "get_model_context_length", return_value=ctx):
         comp = ContextCompressor(
             model="test/model", threshold_percent=pct, quiet_mode=True,
@@ -29,27 +29,27 @@ def _make(ctx: int, pct: float = 0.50) -> ContextCompressor:
         return comp
 
 
-class TestSmallContextThresholdFloor:
-    def test_sub_512k_floors_to_75_percent(self):
+class TestModelRelativeThreshold:
+    def test_sub_512k_keeps_configured_ratio(self):
         for ctx in (128_000, 200_000, 262_144, 511_999):
-            comp = _make(ctx, pct=0.50)
-            assert comp.threshold_percent == 0.75, ctx
-            assert comp.threshold_tokens == int(ctx * 0.75), ctx
+            comp = _make(ctx, pct=0.70)
+            assert comp.threshold_percent == 0.70, ctx
+            assert comp.threshold_tokens == int(ctx * 0.70), ctx
 
 
 
 
-    def test_update_model_rederives_floor_both_directions(self):
-        comp = _make(128_000, pct=0.50)
-        assert comp.threshold_percent == 0.75
-        # small -> large: back to the configured 50%
+    def test_update_model_rederives_ratio_both_directions(self):
+        comp = _make(128_000, pct=0.70)
+        assert comp.threshold_percent == 0.70
+        # small -> large: keep the configured 70%
         comp.update_model("big", 1_000_000)
-        assert comp.threshold_percent == 0.50
-        assert comp.threshold_tokens == 500_000
-        # large -> small: floor re-applies
+        assert comp.threshold_percent == 0.70
+        assert comp.threshold_tokens == 700_000
+        # large -> small: the same ratio remains active
         comp.update_model("small", 200_000)
-        assert comp.threshold_percent == 0.75
-        assert comp.threshold_tokens == 150_000
+        assert comp.threshold_percent == 0.70
+        assert comp.threshold_tokens == 140_000
 
 
 class TestReasoningExcludedFromSummarizer:

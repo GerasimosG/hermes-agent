@@ -223,7 +223,7 @@ def test_removing_model_thresholds_restores_empty_map(monkeypatch):
     _sync_with_cfg(monkeypatch, session, {"compression": {}})
     assert compressor.model_thresholds == {}
     # The stale per-model override must stop steering the live threshold too.
-    assert compressor.threshold_percent == 0.50
+    assert compressor.threshold_percent == 0.70
 
 
 def test_removing_threshold_restores_derived_default(monkeypatch):
@@ -234,9 +234,9 @@ def test_removing_threshold_restores_derived_default(monkeypatch):
         session,
         {"model": {"context_length": 600_000}, "compression": {}},
     )
-    assert compressor._config_threshold_percent == 0.50
-    assert compressor.threshold_percent == 0.50
-    assert compressor.threshold_tokens == int(600_000 * 0.50)
+    assert compressor._config_threshold_percent == 0.70
+    assert compressor.threshold_percent == 0.70
+    assert compressor.threshold_tokens == int(600_000 * 0.70)
 
 
 def test_removing_context_length_reinfers_from_model_metadata(monkeypatch):
@@ -253,7 +253,7 @@ def test_removing_context_length_reinfers_from_model_metadata(monkeypatch):
     _sync_with_cfg(monkeypatch, session, {"model": {}, "compression": {}})
     assert compressor._config_context_length is None
     assert compressor.context_length == 1_000_000
-    assert compressor.threshold_tokens == int(1_000_000 * 0.50)
+    assert compressor.threshold_tokens == int(1_000_000 * 0.70)
 
 
 def test_removing_idle_compact_after_seconds_restores_zero(monkeypatch):
@@ -277,8 +277,8 @@ def test_removing_codex_native_compaction_restores_false(monkeypatch):
     assert session["agent"].codex_responses_native_compaction is False
 
 
-def test_removing_codex_native_threshold_restores_default(monkeypatch):
+def test_removing_codex_native_threshold_restores_local_trigger(monkeypatch):
     session, _ = _neutral_session()
     session["agent"].codex_responses_compact_threshold = 120_000
     _sync_with_cfg(monkeypatch, session, {"compression": {}})
-    assert session["agent"].codex_responses_compact_threshold == 200_000
+    assert session["agent"].codex_responses_compact_threshold is None

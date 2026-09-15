@@ -64,7 +64,7 @@ class ContextEngine(ABC):
     # prompt (3 keeps the historical head shape).
     # These control the preflight compression check. Subclasses may override via __init__ or property;
     # defaults are sensible for most engines. See #13754.
-    threshold_percent: float = 0.75
+    threshold_percent: float = 0.70
     protect_first_n: int = 3
     protect_last_n: int = 6
     # False keeps successful automatic compaction passes silent (routine background

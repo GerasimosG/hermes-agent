@@ -583,8 +583,8 @@ DEFAULT_CONFIG = {
         "hygiene_failure_cooldown_seconds": 300,  # skip repeated failed hygiene attempts
         # Max seconds an ARRIVING user turn is held while a streaming hygiene summary finishes;
         # bounds user-visible latency (keep under chat idle timeouts, Telegram ~30s). On expiry the
-        # turn proceeds uncompressed; the detached worker keeps its watermark-fenced commit, so the
-        # summary is adopted at the next safe boundary.
+        # turn is deferred rather than sent with an oversized transcript; the detached worker keeps
+        # its watermark-fenced commit for the next retry.
         "hygiene_max_turn_hold_seconds": 10,
         # Inactivity budget for in-agent compress_context (loop, /compress, preflight); same
         # progress-aware semantics as hygiene_timeout_seconds. 0 = disable the owned wrapper
@@ -602,12 +602,11 @@ DEFAULT_CONFIG = {
         # instead of dropping the middle with a "summary unavailable" placeholder; the session
         # freezes at its size until /compress (bypasses the cooldown) or /new.
         "abort_on_summary_failure": False,
-        # (Historical key name.) When True, gpt-5.4/5.5/5.6 and gpt-6 Astra (any slug containing
-        # "astra" without "900k") on the ChatGPT Codex OAuth route raise their compaction trigger to
-        # 85%: Codex hard-caps them at a 272K window, so the global 50% would compact at ~136K. False = global `threshold`. Only that route; the same models via
-        # OpenAI direct, OpenRouter or Copilot keep the global value.
-        "codex_gpt55_autoraise": True,
-        # Show the one-time autoraise banner; False keeps the autoraise, hides the notice.
+        # Legacy compatibility key. Automatic model/route-specific raises are disabled so every
+        # active model starts server-side compression at the configured model-relative threshold.
+        # Explicit `model_thresholds` entries remain the supported opt-in override mechanism.
+        "codex_gpt55_autoraise": False,
+        # Retained for compatibility with older configs; no automatic raise means no banner.
         "codex_gpt55_autoraise_notice": True,
         # Codex app-server thread compaction mode. The codex agent owns the thread context, so
         # Hermes' summarizer cannot shrink it. native = codex decides; hermes = Hermes' threshold
@@ -628,7 +627,7 @@ DEFAULT_CONFIG = {
         # Per-model threshold overrides: keys substring-match the model name (longest wins), values
         # replace the global `threshold`, e.g. {"glm-5.2": 0.40}. Prefix a key with "<provider>:" to
         # scope it to one route ({"openai-codex:astra": 0.85} leaves Astra on OpenRouter/Nous at the
-        # global value). The <512K floor (0.75) still applies raise-only on top.
+        # global value). Values are explicit opt-ins; no automatic small-window floor is applied.
         "model_thresholds": {},
         # Opt-in idle compaction (0 = off): a session resuming after this many idle seconds compacts
         # up front, before the first reply. Time-based complement to `threshold`; skipped when

@@ -189,15 +189,25 @@ def hygiene_compaction_recovered(
 
 def _hygiene_compression_timeout_message(
     *, total_exhausted: bool, elapsed: float, idle_timeout: float, progress_observed: bool) -> str:
-    """Describe the host timeout that actually ended hygiene compression. Chat users cannot edit
-    model config, so the copy names /compress, /new and `hermes doctor`, never a config key or the
-    raw second counts (those stay in the gateway log)."""
-    lead = (
-        "⚠️ Shortening the conversation history took too long, so I skipped it and kept "
-        "everything as-is. Run /compress to try again or /new to start fresh.")
+    """Explain why required compression stopped and confirm that the turn was not sent.
+
+    The gateway must not imply that it kept an oversized transcript after compression failed. The
+    notice names the failure boundary so users can distinguish a total wait ceiling from an idle
+    summary-model timeout. Detailed session identifiers remain in the gateway log.
+    """
     if total_exhausted:
-        return lead
-    return lead + " If this keeps happening, run `hermes doctor` on the host."
+        if progress_observed:
+            reason = f"at the total ceiling after {elapsed:.1f}s; summary output was observed"
+        else:
+            reason = f"at the total ceiling after {elapsed:.1f}s with no output from the summary model"
+    elif progress_observed:
+        reason = f"after the {idle_timeout:.1f}s idle timeout while summary output was still arriving"
+    else:
+        reason = f"after no output from the summary model for {idle_timeout:.1f}s"
+    return (
+        f"⚠️ Context compression timed out {reason}. This message was not sent to the model. "
+        "Run /compress to try again or /new to start fresh."
+    )
 
 
 def _cached_agent_for_hygiene(gateway, session_key: str):
