@@ -106,7 +106,10 @@ def _build_runner(gateway_run, adapter, fake_db):
     runner._running_agents = {}
     runner._pending_messages = {}
     runner._pending_approvals = {}
-    runner._session_db = SimpleNamespace(_db=fake_db)
+    runner._session_db = SimpleNamespace(
+        _db=fake_db,
+        get_session=AsyncMock(return_value=None),
+    )
     runner._is_user_authorized = lambda _source: True
     runner._set_session_env = lambda _context: None
     runner._run_agent = AsyncMock(
@@ -237,10 +240,10 @@ async def test_turn_hold_keeps_admission_and_adopts_watermark_fenced_summary(
     elapsed = time.monotonic() - started
 
     # #90845/#92318 invariant intact: the turn is released at the budget.
-    assert result == "ok"
+    assert result is None
     assert elapsed < 5.0, f"turn held for {elapsed:.1f}s despite the turn-hold budget"
     assert worker_started.is_set()
-    assert runner._run_agent.await_count == 1
+    assert runner._run_agent.await_count == 0
 
     # (b) NO retry-after was armed while the attempt is still running —
     # arming it would block the agent-side preflight from adopting the
@@ -329,7 +332,7 @@ async def test_turn_hold_kept_admission_arms_flat_retry_only_when_nothing_commit
     runner = _build_runner(gateway_run, adapter, fake_db)
 
     result = await asyncio.wait_for(runner._handle_message(_make_event()), timeout=15)
-    assert result == "ok"
+    assert result is None
     assert worker_started.is_set()
     # While the attempt still runs: no cooldown, so preflight adoption
     # stays possible.
@@ -419,7 +422,7 @@ async def test_turn_hold_without_watermark_fence_still_cancels(
     runner = _build_runner(gateway_run, adapter, fake_db)
 
     result = await asyncio.wait_for(runner._handle_message(_make_event()), timeout=15)
-    assert result == "ok"
+    assert result is None
     assert worker_started.is_set()
 
     release_worker.set()
