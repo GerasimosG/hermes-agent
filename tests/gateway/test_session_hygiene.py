@@ -183,19 +183,6 @@ def test_gateway_reads_the_shared_compression_threshold():
     assert settings.threshold_pct == 0.70
 
 
-def test_hygiene_total_ceiling_warning_reports_elapsed_and_progress():
-    from gateway.run import _hygiene_compression_timeout_message
-
-    warning = _hygiene_compression_timeout_message(
-        total_exhausted=True, elapsed=600.4, idle_timeout=30.0, progress_observed=True,
-    )
-
-    assert "total ceiling after 600.4s" in warning
-    assert "summary output was observed" in warning
-    assert "30.0s" not in warning
-    assert "no output" not in warning
-
-
 @pytest.mark.parametrize("total_exhausted", [True, False])
 def test_hygiene_timeout_warning_names_chat_commands_not_config(total_exhausted):
     """The chat user cannot edit model config or read second counts; the notice names the
