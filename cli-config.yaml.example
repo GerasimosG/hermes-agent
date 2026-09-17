@@ -878,6 +878,7 @@ prompt_caching:
 #   compression:
 #     provider: "auto"
 #     model: ""
+#     # main_model_only: false  # true = never switch compression to another model
 #     # max_concurrency: 2    # Optional: cap simultaneous compression calls
 #
 #   # Post-turn memory/skill self-improvement review fork. Runs after a turn

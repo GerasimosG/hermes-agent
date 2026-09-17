@@ -181,9 +181,10 @@ compression:
 # Summarization model/provider configured under auxiliary:
 auxiliary:
   compression:
-    model: null              # Override model for summaries (default: auto-detect)
+    model: ""              # Empty = use the active main model
     provider: auto           # Provider: "auto", "openrouter", "nous", "main", etc.
     base_url: null           # Custom OpenAI-compatible endpoint
+    main_model_only: false   # true = never switch compression to another model/provider
 ```
 
 ### Parameter Details
@@ -204,6 +205,21 @@ auxiliary:
 | `codex_responses_native` | `false` | bool | Opt in to OpenAI's server-side compaction on the Responses API. Engages only for gpt-5.6-family models on the direct OpenAI API or a ChatGPT Codex subscription (see below) |
 | `codex_responses_compact_threshold` | `null` | `null` or positive integer | `null` follows the resolved local compression trigger with an 8,192 token safety margin. A positive integer remains absolute and only clamps downward when required. Invalid values use automatic behavior. Automatic mode falls back to `200000` when no usable local trigger exists |
 | `in_place` | `true` | bool | Compact on the same session id instead of rotating to a new one (see below) |
+| `main_model_only` | `false` | bool | When `true`, compression uses the active main provider/model only. It does not enter another-model fallback or discovery if that route fails; the compression attempt fails visibly and the conversation remains uncompressed |
+
+### Strict selected-model compression
+
+Set `auxiliary.compression.provider: auto`, leave `auxiliary.compression.model` empty, and set `auxiliary.compression.main_model_only: true` when summaries must use exactly the model selected for the current session:
+
+```yaml
+auxiliary:
+  compression:
+    provider: auto
+    model: ""
+    main_model_only: true
+```
+
+`auto` first resolves the live main provider and model, including ChatGPT/Codex sessions. With `main_model_only: true`, Hermes may retry that same route, but it will not switch compression to OpenRouter, Nous, Gemini, or another configured fallback model. If the selected route is unavailable, Hermes leaves the context unchanged and reports the compression failure instead of hiding it through a model switch. Other auxiliary tasks keep their existing routing and fallback behavior.
 
 ### In-place compaction (single stable session id)
 
