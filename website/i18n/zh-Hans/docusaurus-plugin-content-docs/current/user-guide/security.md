@@ -539,12 +539,12 @@ security:
   tirith_enabled: true       # 启用/禁用 tirith 扫描（默认：true）
   tirith_path: "tirith"      # tirith 二进制路径（默认：PATH 查找）
   tirith_timeout: 5          # 子进程超时（秒）
-  tirith_fail_open: true     # tirith 不可用时允许执行（默认：true）
+  tirith_fail_open: false    # tirith 不可用时允许执行（显式选择）
 ```
 
-当 `tirith_fail_open` 为 `true`（默认）时，若 tirith 未安装或超时，命令照常执行。在高安全性环境中，将其设置为 `false` 可在 tirith 不可用时阻止命令执行。
+当显式将 `tirith_fail_open` 设置为 `true` 时，仅当 tirith 发生不可用或超时等基础设施故障时命令才会照常执行。tirith 的正向检测仍按扫描器判定阻止或警告。默认值为 `false`，会在 tirith 不可用时阻止命令执行。
 
-Tirith 为 Linux（x86_64 / aarch64）和 macOS（x86_64 / arm64）提供预构建二进制文件。在没有预构建二进制文件的平台（Windows 等）上，tirith 会被静默跳过——模式匹配防护仍然运行，CLI 不会显示"不可用"横幅。若要在 Windows 上使用 tirith，请在 WSL 下运行 Hermes。
+Tirith 为 Linux（x86_64 / aarch64）和 macOS（x86_64 / arm64）提供预构建二进制文件。在没有预构建二进制文件的平台（Windows 等）上，默认的故障关闭策略会阻止无法扫描的命令；设置 `tirith_fail_open: true` 可使用现有的仅模式匹配回退。若要在 Windows 上使用 tirith，请在 WSL 下运行 Hermes。
 
 Tirith 的判定与审批流程集成：安全命令直接通过，可疑和被阻止的命令会触发用户审批，并附上完整的 tirith 发现（严重性、标题、描述、更安全的替代方案）。用户可以批准或拒绝——默认选择为拒绝，以确保无人值守场景的安全。
 

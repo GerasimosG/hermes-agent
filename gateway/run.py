@@ -3547,7 +3547,7 @@ class GatewayRunner(
         """Ensure tirith is installed and warn when manual approvals have no automated assessor."""
         def _ensure_tirith() -> None:
             from tools.tirith_security import ensure_installed
-            ensure_installed(log_failures=False)  # downloads if needed; fail-open at scan time
+            ensure_installed(log_failures=False)  # downloads if needed; scan-time policy decides fallback
 
         _best_effort(_ensure_tirith)
 

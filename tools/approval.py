@@ -636,6 +636,7 @@ def _unattended_deny(command: str, ctx: _Unattended) -> dict | None:
         tirith = check_command_security(command)
     except ImportError:
         if _tirith_fail_open():
+            logger.warning("event=tirith_fail_open_bypass reason=scanner_import_error surface=unattended")
             return None
         return {"approved": False, "message": (
             "BLOCKED: the Tirith security scanner could not be imported and security.tirith_fail_open is false, "
@@ -1089,14 +1090,16 @@ def _format_tirith_description(tirith_result: dict) -> str:
 
 
 def _tirith_scan(command: str) -> dict:
-    """Tirith result for the interactive flow; an un-importable scanner allows
-    (default) or, under fail-closed, synthesizes a HIGH warn finding that goes
+    """Tirith result for the interactive flow; an un-importable scanner fails
+    closed by default or allows only with explicit opt-in, while the closed path
+    synthesizes a HIGH warn finding that goes
     through the normal approval flow (#20733)."""
     try:
         from tools.tirith_security import check_command_security
         return check_command_security(command)
     except ImportError:
         if _tirith_fail_open():
+            logger.warning("event=tirith_fail_open_bypass reason=scanner_import_error surface=interactive")
             return {"action": "allow", "findings": [], "summary": ""}
         return {"action": "warn", "summary": "Tirith unavailable (fail-closed)", "findings": [{
             "rule_id": "tirith-import-error", "severity": "HIGH",

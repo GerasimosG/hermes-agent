@@ -7,11 +7,43 @@ gate in :mod:`tools.approval`.
 
 import contextvars
 import logging
+import math
+import ntpath
 import os
+import stat
+from pathlib import Path
 from hermes_cli.config import cfg_get
 from utils import env_var_enabled, is_truthy_value
 
 logger = logging.getLogger("tools.approval")
+
+_TIRITH_TRUE_VALUES = frozenset({"1", "true", "yes", "on"})
+_TIRITH_FALSE_VALUES = frozenset({"0", "false", "no", "off"})
+
+
+def parse_tirith_env_bool(name: str) -> tuple[bool | None, bool]:
+    """Return an optional Tirith boolean override and whether its spelling is valid."""
+    raw = os.getenv(name)
+    if raw is None:
+        return None, True
+    normalized = raw.strip().lower()
+    if normalized in _TIRITH_TRUE_VALUES:
+        return True, True
+    if normalized in _TIRITH_FALSE_VALUES:
+        return False, True
+    return None, False
+
+
+def parse_tirith_env_timeout(name: str) -> tuple[int | None, bool]:
+    """Return an optional positive Tirith timeout override and its validity."""
+    raw = os.getenv(name)
+    if raw is None:
+        return None, True
+    try:
+        timeout = int(raw)
+    except (TypeError, ValueError):
+        return None, False
+    return (timeout, True) if timeout > 0 else (None, False)
 
 
 def _ctx(name: str, default: "str | None" = "") -> contextvars.ContextVar:
@@ -306,15 +338,134 @@ def _get_unattended_approval_mode() -> str:
 
 
 def _tirith_fail_open() -> bool:
-    """``security.tirith_fail_open`` (default True; True when config is unreadable).
+    """``security.tirith_fail_open`` (default False; False when config is unreadable).
     False means the operator opted into fail-closed: an un-importable scanner
-    must not silently grant access."""
+    must not silently grant access. A valid explicit ``tirith_enabled: false``
+    disables this scanner by policy, so its import failure is allowed while the
+    remaining command guards still run. The validation stays local because this
+    function is used when ``tools.tirith_security`` itself cannot be imported."""
     try:
-        from hermes_cli.config import load_config_readonly
-        _sec = (load_config_readonly() or {}).get("security", {}) or {}
-        return bool(_sec.get("tirith_fail_open", True)) if _sec.get("tirith_enabled", True) else True
+        from hermes_cli.config import get_active_config_parse_failure, load_config_readonly
+        loaded = load_config_readonly()
+        if not isinstance(loaded, dict) or get_active_config_parse_failure() is not None:
+            return False
+        _sec = loaded.get("security", {})
+        if "security" in loaded and not isinstance(_sec, dict):
+            return False
+        if not isinstance(_sec, dict):
+            return False
+        enabled = _sec.get("tirith_enabled", True)
+        if not isinstance(enabled, bool):
+            return False
+        configured_path = _sec.get("tirith_path", "tirith")
+        if not _valid_tirith_path(configured_path):
+            return False
+        if (os.name != "nt" and configured_path != "tirith"
+                and not _safe_tirith_binary(configured_path)):
+            return False
+        env_path = os.getenv("TIRITH_BIN")
+        if env_path is not None and not _valid_tirith_path(env_path):
+            return False
+        if (os.name != "nt" and env_path is not None and env_path != "tirith"
+                and not _safe_tirith_binary(env_path)):
+            return False
+        timeout = _sec.get("tirith_timeout", 5)
+        if (isinstance(timeout, bool) or not isinstance(timeout, (int, float))
+                or timeout <= 0 or (isinstance(timeout, float) and not math.isfinite(timeout))):
+            return False
+        fail_open = _sec.get("tirith_fail_open", False)
+        if not isinstance(fail_open, bool):
+            return False
+        env_enabled, enabled_valid = parse_tirith_env_bool("TIRITH_ENABLED")
+        env_timeout, timeout_valid = parse_tirith_env_timeout("TIRITH_TIMEOUT")
+        env_override, fail_open_valid = parse_tirith_env_bool("TIRITH_FAIL_OPEN")
+        if not enabled_valid or not timeout_valid or not fail_open_valid:
+            return False
+        if env_enabled is not None:
+            enabled = env_enabled
+        if not enabled:
+            return True
+        if env_override is not None:
+            return env_override
+        return fail_open
     except Exception:
+        return False
+
+
+def _valid_tirith_path(path: object, *, is_windows: bool | None = None) -> bool:
+    """Mirror the scanner path syntax checks for import-fallback decisions."""
+    if not isinstance(path, str) or not path or path != path.strip():
+        return False
+    if (any(not char.isprintable() for char in path)
+            or any(char in path for char in ";|&$`<>*?[](){}!")):
+        return False
+    if path == "tirith":
         return True
+    expanded = os.path.expanduser(path)
+    windows = os.name == "nt" if is_windows is None else is_windows
+    if windows:
+        if path.startswith(("\\\\", "//")) or path.endswith((".", " ")):
+            return False
+        drive, tail = ntpath.splitdrive(expanded)
+        if (drive and not ntpath.isabs(expanded)) or (not drive and expanded.startswith(("\\", "/"))):
+            return False
+        if ":" in tail or tail.endswith(("\\", "/")):
+            return False
+        parts = [part for part in tail.replace("/", "\\").split("\\") if part not in {"", "."}]
+        if any(part == ".." for part in parts):
+            return False
+        if not drive and ("/" in path or "\\" in path):
+            return False
+        reserved_check = getattr(ntpath, "isreserved", None)
+        reserved_names = {"CON", "PRN", "AUX", "NUL", *(f"COM{i}" for i in range(1, 10)),
+                          *(f"LPT{i}" for i in range(1, 10))}
+        for part in parts:
+            if reserved_check is not None and reserved_check(part):
+                return False
+            stem = part.rstrip(" .").split(".", 1)[0].upper()
+            if stem in reserved_names:
+                return False
+        return bool(drive or ntpath.basename(expanded))
+    if not os.path.isabs(expanded) or expanded in {".", "..", os.sep} or expanded.endswith(os.sep):
+        return False
+    return ".." not in expanded.split(os.sep)
+
+
+def _safe_tirith_binary(path: object) -> bool:
+    """Mirror Linux executable metadata checks when the scanner cannot import."""
+    if not isinstance(path, str):
+        return False
+    expanded = os.path.expanduser(path)
+    if not os.path.isabs(expanded) or ".." in Path(expanded).parts:
+        return False
+    try:
+        euid_getter = getattr(os, "geteuid", None)
+        if euid_getter is None:
+            return False
+        euid = euid_getter()
+        trusted_uids = {euid, 0, os.lstat(os.sep).st_uid}
+        file_stat = os.lstat(expanded)
+        if (not stat.S_ISREG(file_stat.st_mode)
+                or file_stat.st_uid not in trusted_uids
+                or file_stat.st_mode & (stat.S_IWGRP | stat.S_IWOTH)
+                or not file_stat.st_mode & stat.S_IXUSR
+                or not os.access(expanded, os.X_OK)):
+            return False
+        current_stat = os.lstat(expanded)
+        if (current_stat.st_dev, current_stat.st_ino, current_stat.st_mode, current_stat.st_uid) != (
+                file_stat.st_dev, file_stat.st_ino, file_stat.st_mode, file_stat.st_uid):
+            return False
+        for parent in Path(expanded).parents:
+            parent_stat = os.lstat(parent)
+            parent_writable = bool(parent_stat.st_mode & (stat.S_IWGRP | stat.S_IWOTH))
+            sticky_shared = bool(parent_stat.st_mode & stat.S_ISVTX)
+            if (not stat.S_ISDIR(parent_stat.st_mode)
+                    or parent_stat.st_uid not in trusted_uids
+                    or (parent_writable and not sticky_shared)):
+                return False
+    except (OSError, ValueError):
+        return False
+    return True
 
 
 def _get_approval_transport_config() -> tuple[str, str | None]:
