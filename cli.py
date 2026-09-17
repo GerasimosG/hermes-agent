@@ -3031,7 +3031,7 @@ class HermesCLI(CLIProcessNotificationsMixin, CLIAgentSetupMixin, CLICommandsMix
             ):
                 _cprint(
                     f"  {_DIM}⚠ tirith security scanner enabled but not available "
-                    f"— command scanning will use pattern matching only{_RST}"
+                    f"— commands will require approval or be blocked until it is available{_RST}"
                 )
         except Exception:
             pass

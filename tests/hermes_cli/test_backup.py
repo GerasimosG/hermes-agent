@@ -321,6 +321,7 @@ class TestBackup:
 
         out_dir = tmp_path / "external-drive"
         out_dir.mkdir()
+        out_dir.chmod(0o700)
         out_zip = out_dir / "backup.zip"
         args = Namespace(output=str(out_zip))
 
@@ -352,6 +353,7 @@ class TestBackup:
 
         out_zip = hermes_home / "backups" / "pre-update-test.zip"
         out_zip.parent.mkdir(parents=True, exist_ok=True)
+        out_zip.parent.chmod(0o700)
 
         import hermes_cli.backup as backup_mod
         staged_dirs = []
@@ -1833,6 +1835,31 @@ class TestRunPreUpdateBackup:
 
 
 
+    def test_quick_snapshot_durability_warning_is_reported(self, hermes_home, capsys, monkeypatch):
+        from hermes_cli import backup as backup_mod
+        import hermes_cli.update_cmd_maint as update_maint
+        from hermes_cli.update_cmd import _run_pre_update_backup
+
+        warning = backup_mod.QuickSnapshotCommittedWithDurabilityWarning(
+            hermes_home / "state-snapshots" / "pre-update", OSError("directory sync failed")
+        )
+        monkeypatch.setattr(
+            backup_mod,
+            "create_quick_snapshot",
+            lambda **_kwargs: (_ for _ in ()).throw(warning),
+        )
+        monkeypatch.setattr(backup_mod, "create_pre_update_snapshots_all_profiles", lambda **_kwargs: {})
+        monkeypatch.setattr(update_maint, "_verify_state_db_after_snapshot", lambda _snapshot_id: None)
+        self._set_mode(hermes_home, "quick")
+
+        snap_id = _run_pre_update_backup(Namespace(no_backup=False, backup=False))
+        out = capsys.readouterr().out
+
+        assert snap_id == "pre-update"
+        assert "directory durability could not be confirmed" in out
+        assert "durability warning" in out
+
+
 # ---------------------------------------------------------------------------
 # Pre-migration backup (hermes claw migrate safety net)
 # ---------------------------------------------------------------------------
@@ -2490,12 +2517,14 @@ def test_run_backup_prunes_older_default_named_zips_but_not_others(tmp_path, mon
     (home / "config.yaml").write_text("model: x\n")
     monkeypatch.setenv("HERMES_HOME", str(home))
     monkeypatch.setattr(Path, "home", lambda: tmp_path)
+    backup_dir = home / "backups"
+    backup_dir.mkdir()
     for i in range(4):
-        (tmp_path / f"hermes-backup-2026-01-0{i + 1}-000000.zip").write_bytes(b"old")
-    (tmp_path / "my-archive.zip").write_bytes(b"mine")
+        (backup_dir / f"hermes-backup-2026-01-0{i + 1}-000000.zip").write_bytes(b"old")
+    (backup_dir / "my-archive.zip").write_bytes(b"mine")
 
     backup_mod.run_backup(Namespace(output=None, keep=2))
 
-    kept = sorted(p.name for p in tmp_path.glob("hermes-backup-*.zip"))
+    kept = sorted(p.name for p in (home / "backups").glob("hermes-backup-*.zip"))
     assert len(kept) == 2 and kept[0] == "hermes-backup-2026-01-04-000000.zip"
-    assert (tmp_path / "my-archive.zip").exists()
+    assert (backup_dir / "my-archive.zip").exists()

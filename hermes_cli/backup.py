@@ -3,12 +3,12 @@
 import json
 import logging
 import os
+import secrets
 import shutil
 import sqlite3
 import stat
 import sys
 import tempfile
-import threading
 import time
 import zipfile
 from contextlib import closing, contextmanager, suppress
@@ -28,6 +28,13 @@ from utils import (
 from hermes_cli.sizefmt import format_bytes as _format_size
 
 logger = logging.getLogger(__name__)
+
+# Capture the platform capability before tests or embedding applications wrap
+# ``os.open``/``os.mkdir``.  ``os.supports_dir_fd`` stores the original
+# builtins by identity, so checking the live attributes would reject an
+# otherwise supported platform when a wrapper is installed.
+_OPEN_SUPPORTS_DIR_FD = os.open in os.supports_dir_fd
+_MKDIR_SUPPORTS_DIR_FD = os.mkdir in os.supports_dir_fd
 
 # --- Exclusion rules ---
 
@@ -137,6 +144,30 @@ class BackupInProgressError(RuntimeError):
     """Raised when another process already owns the Hermes backup slot."""
 
 
+class BackupCommittedWithDurabilityWarning(OSError):
+    """The archive is published, but its containing directory was not synced."""
+
+    def __init__(self, path: Path, error: OSError):
+        self.path = Path(path)
+        self.error = error
+        super().__init__(
+            f"backup committed at {self.path}, but directory durability could not be confirmed: {error}"
+        )
+
+
+class QuickSnapshotCommittedWithDurabilityWarning(OSError):
+    """A quick snapshot was published, but its root directory was not synced."""
+
+    def __init__(self, path: Path, error: OSError):
+        self.path = Path(path)
+        self.snapshot_id = self.path.name
+        self.error = error
+        super().__init__(
+            f"quick snapshot committed at {self.path}, but snapshot-root directory durability "
+            f"could not be confirmed: {error}"
+        )
+
+
 class _SQLiteSnapshotError(RuntimeError):
     pass
 
@@ -149,7 +180,10 @@ class _SQLiteBackupTimeout(RuntimeError):
 def _backup_operation_lock(hermes_home: Path, timeout_seconds: float = 0.25):
     """Acquire one cross-process backup slot for full and quick snapshots."""
     lock_path = hermes_home / ".backup.lock"
-    lock_path.parent.mkdir(parents=True, exist_ok=True)
+    lock_parent_fd = open_trusted_directory(
+        lock_path.parent, create=True, allow_current_owner_writable=True
+    )
+    os.close(lock_parent_fd)
     handle = lock_path.open("a+b")
     acquired = False
     deadline = time.monotonic() + max(0.0, timeout_seconds)
@@ -184,17 +218,303 @@ def _backup_operation_lock(hermes_home: Path, timeout_seconds: float = 0.25):
         handle.close()
 
 
+def open_trusted_directory(
+    path: Path, *, create: bool = False, owner_only: bool = False, tighten: bool = False,
+    allow_current_owner_writable: bool = False,
+) -> int:
+    """Open *path* by walking every component with ``O_NOFOLLOW``.
+
+    Existing components must be directories owned by the current user or root and may not be
+    group/other writable (a root-owned sticky directory is a safe shared boundary such as
+    ``/tmp``). Missing components are created mode ``0700``. ``tighten`` permits an existing final
+    component owned by the current user to be tightened to ``0700`` for managed backup roots.
+    ``allow_current_owner_writable`` is reserved for a managed path whose private final directory
+    is anchored below a normal user-owned home; it never permits an unowned writable component.
+    The returned descriptor is the only path anchor callers should use for staging and rename.
+    """
+    directory = Path(path)
+    if not directory.is_absolute():
+        directory = Path.cwd() / directory
+    if directory.anchor != os.sep or ".." in directory.parts:
+        raise OSError(f"invalid backup directory path: {directory}")
+    uid_getter = getattr(os, "geteuid", None)
+    if (uid_getter is None or not hasattr(os, "O_NOFOLLOW")
+            or not hasattr(os, "O_DIRECTORY") or not _OPEN_SUPPORTS_DIR_FD
+            or not _MKDIR_SUPPORTS_DIR_FD):
+        raise OSError("backup directory security primitives are unavailable on this platform")
+    current_uid = uid_getter()
+    flags = os.O_RDONLY | os.O_NOFOLLOW
+    flags |= os.O_DIRECTORY | getattr(os, "O_CLOEXEC", 0)
+    current_fd = os.open(os.sep, flags)
+    try:
+        root_stat = os.fstat(current_fd)
+        trusted_uids = {current_uid, 0, root_stat.st_uid}
+        if (not stat.S_ISDIR(root_stat.st_mode)
+                or root_stat.st_mode & (stat.S_IWGRP | stat.S_IWOTH)):
+            raise OSError("trusted backup root is not owner-safe")
+        components = directory.parts[1:]
+        if owner_only and not components:
+            raise OSError(f"backup directory must be owner-only 0700: {directory}")
+        for index, component in enumerate(components):
+            is_final = index == len(components) - 1
+            try:
+                next_fd = os.open(component, flags, dir_fd=current_fd)
+            except FileNotFoundError:
+                if not create:
+                    raise
+                try:
+                    os.mkdir(component, 0o700, dir_fd=current_fd)
+                except FileExistsError:
+                    # A concurrent creator may have won the name race.  Reopen with
+                    # O_NOFOLLOW below so a symlink winner still fails closed.
+                    pass
+                next_fd = os.open(component, flags, dir_fd=current_fd)
+            previous_fd = current_fd
+            current_fd = next_fd
+            os.close(previous_fd)
+            component_stat = os.fstat(current_fd)
+            component_writable = bool(
+                component_stat.st_mode & (stat.S_IWGRP | stat.S_IWOTH)
+            )
+            sticky_shared = bool(component_stat.st_mode & stat.S_ISVTX)
+            owner_only_final = is_final and owner_only and component_stat.st_uid == current_uid
+            current_owner_writable = (
+                allow_current_owner_writable and component_stat.st_uid == current_uid
+            )
+            if (not stat.S_ISDIR(component_stat.st_mode)
+                    or component_stat.st_uid not in trusted_uids
+                    or (component_writable and not sticky_shared
+                        and not owner_only_final and not current_owner_writable)):
+                if owner_only:
+                    raise OSError(f"backup directory must be owner-only 0700: {directory}")
+                raise OSError(f"backup directory component is not trusted: {directory}")
+            if is_final and owner_only:
+                if component_stat.st_uid != current_uid:
+                    raise OSError(f"backup directory must be owned by the current user: {directory}")
+                if stat.S_IMODE(component_stat.st_mode) != 0o700:
+                    if not tighten:
+                        raise OSError(f"backup directory must be owner-only 0700: {directory}")
+                    os.fchmod(current_fd, 0o700)
+                    if stat.S_IMODE(os.fstat(current_fd).st_mode) != 0o700:
+                        raise OSError(f"backup directory could not be tightened to 0700: {directory}")
+        result_fd = current_fd
+        current_fd = -1
+        return result_fd
+    finally:
+        if current_fd >= 0:
+            with suppress(OSError):
+                os.close(current_fd)
+
+
 @contextmanager
 def _atomic_output_path(final_path: Path):
-    """Yield a hidden sibling path and publish it only after a clean close."""
-    partial_path = final_path.with_name(f".{final_path.name}.{os.getpid()}-{threading.get_ident()}.partial")
-    partial_path.unlink(missing_ok=True)
+    """Write a private archive beside *final_path*, then replace it atomically.
+
+    The destination parent must already exist and be an owner-only ``0700`` directory.  It is
+    opened once and all stage/destination operations use that descriptor, so a path swap cannot
+    redirect the write.  Windows has no equivalent portable set of guarantees here and fails
+    closed rather than publishing an unproven archive.
+    """
+    final_path = Path(final_path)
+    if not final_path.is_absolute():
+        final_path = Path.cwd() / final_path
+    if ".." in final_path.parts or not final_path.name:
+        raise OSError(f"invalid backup output path: {final_path}")
+    parent_path = final_path.parent
+    parent_fd = -1
+    destination_fd = -1
+    latest_destination_fd = -1
+    staging_fd = -1
+    stage_name = None
+    staged_identity = None
+    committed = False
+    primary_error: Optional[BaseException] = None
+
+    def record_cleanup_failure(
+        action: str, error: OSError, primary: Optional[BaseException] = None
+    ) -> None:
+        message = f"backup cleanup failed while {action}: {error}"
+        logger.error(message)
+        target = primary or primary_error
+        if target is not None:
+            add_note = getattr(target, "add_note", None)
+            if add_note is not None:
+                add_note(message)
+
     try:
-        yield partial_path
-        os.replace(partial_path, final_path)
-    except BaseException:
-        partial_path.unlink(missing_ok=True)
+        if not hasattr(os, "fsync"):
+            raise OSError("backup staging cannot verify durable writes on this platform")
+        uid_getter = getattr(os, "geteuid", None)
+        if uid_getter is None:
+            raise OSError("backup staging security primitives are unavailable on this platform")
+        current_uid = uid_getter()
+        # The final parent is checked below for exact 0700 permissions.  Ancestors may be the
+        # caller's ordinary home/profile directories, so allow owner-writable ancestors while
+        # still rejecting untrusted owners, group/other-writable nodes, and symlinks.
+        parent_fd = open_trusted_directory(
+            parent_path, owner_only=True, allow_current_owner_writable=True
+        )
+        parent_stat = os.fstat(parent_fd)
+        if (not stat.S_ISDIR(parent_stat.st_mode) or parent_stat.st_uid != current_uid
+                or stat.S_IMODE(parent_stat.st_mode) != 0o700):
+            raise OSError(f"backup output parent must be owner-only 0700: {parent_path}")
+
+        destination_flags = getattr(os, "O_PATH", os.O_RDONLY) | os.O_NOFOLLOW
+        if hasattr(os, "O_CLOEXEC"):
+            destination_flags |= os.O_CLOEXEC
+
+        def open_destination():
+            """Return ``(fd, identity)`` for a regular destination, or ``(-1, None)`` if absent."""
+            if hasattr(os, "O_PATH"):
+                try:
+                    candidate_fd = os.open(final_path.name, destination_flags, dir_fd=parent_fd)
+                except FileNotFoundError:
+                    return -1, None
+                candidate_stat = os.fstat(candidate_fd)
+            else:
+                try:
+                    candidate_stat = os.stat(final_path.name, dir_fd=parent_fd, follow_symlinks=False)
+                except FileNotFoundError:
+                    return -1, None
+                candidate_fd = -1
+            if (not stat.S_ISREG(candidate_stat.st_mode)
+                    or candidate_stat.st_dev != parent_stat.st_dev):
+                if candidate_fd >= 0:
+                    os.close(candidate_fd)
+                raise OSError(f"refusing to replace non-regular backup destination: {final_path}")
+            return candidate_fd, (candidate_stat.st_dev, candidate_stat.st_ino)
+
+        destination_fd, destination_identity = open_destination()
+        if destination_fd >= 0:
+            os.close(destination_fd)
+            destination_fd = -1
+
+        staging_flags = os.O_RDWR | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW
+        if hasattr(os, "O_CLOEXEC"):
+            staging_flags |= os.O_CLOEXEC
+        for attempt in range(128):
+            stage_name = f".{final_path.name}.{secrets.token_hex(8)}.partial"
+            try:
+                staging_fd = os.open(stage_name, staging_flags, 0o600, dir_fd=parent_fd)
+                break
+            except FileExistsError:
+                if attempt == 127:
+                    raise OSError("could not allocate a unique backup staging name")
+        initial_stage_stat = os.fstat(staging_fd)
+        staged_identity = (initial_stage_stat.st_dev, initial_stage_stat.st_ino)
+        if (not stat.S_ISREG(initial_stage_stat.st_mode)
+                or initial_stage_stat.st_uid != current_uid
+                or initial_stage_stat.st_dev != parent_stat.st_dev):
+            raise OSError(f"backup staging file is not owner-safe: {parent_path / stage_name}")
+        if hasattr(os, "fchmod"):
+            os.fchmod(staging_fd, 0o600)
+        if stat.S_IMODE(os.fstat(staging_fd).st_mode) != 0o600:
+            raise OSError(f"backup staging file has unsafe permissions: {parent_path / stage_name}")
+
+        # Keep the original writable descriptor alive after the wrapper closes so its bytes can be
+        # fsynced and its inode rechecked before replacement; close it only after the rename.
+        with os.fdopen(staging_fd, "w+b", closefd=False) as staged_file:  # windows-footgun: ok — binary mode
+            yield staged_file
+            staged_file.flush()
+        os.fsync(staging_fd)
+        final_stage_stat = os.fstat(staging_fd)
+        if (not stat.S_ISREG(final_stage_stat.st_mode)
+                or final_stage_stat.st_uid != current_uid
+                or final_stage_stat.st_dev != parent_stat.st_dev
+                or stat.S_IMODE(final_stage_stat.st_mode) != 0o600
+                or (final_stage_stat.st_dev, final_stage_stat.st_ino) != staged_identity):
+            raise OSError(f"backup staging file changed before promotion: {parent_path / stage_name}")
+        stage_path_stat = os.stat(stage_name, dir_fd=parent_fd, follow_symlinks=False)
+        if (not stat.S_ISREG(stage_path_stat.st_mode)
+                or stage_path_stat.st_uid != current_uid
+                or stage_path_stat.st_dev != parent_stat.st_dev
+                or (stage_path_stat.st_dev, stage_path_stat.st_ino) != staged_identity):
+            raise OSError(f"backup staging name changed before promotion: {parent_path / stage_name}")
+
+        # Revalidate the name immediately before replacement.  The pinned directory and the
+        # production backup lock make this race-free for backup writers; a changed node fails closed.
+        latest_destination_fd, latest_destination_identity = open_destination()
+        try:
+            if latest_destination_identity != destination_identity:
+                raise OSError(f"backup destination changed before promotion: {final_path}")
+        except BaseException as validation_error:
+            if latest_destination_fd >= 0:
+                fd = latest_destination_fd
+                latest_destination_fd = -1
+                try:
+                    os.close(fd)
+                except OSError as cleanup_exc:
+                    record_cleanup_failure("closing the destination recheck", cleanup_exc, validation_error)
+            raise
+        else:
+            if latest_destination_fd >= 0:
+                fd = latest_destination_fd
+                latest_destination_fd = -1
+                os.close(fd)
+        os.replace(stage_name, final_path.name, src_dir_fd=parent_fd, dst_dir_fd=parent_fd)
+        committed = True  # disarm stage cleanup immediately after the rename succeeds
+        fd = staging_fd
+        staging_fd = -1
+        try:
+            os.close(fd)
+        except OSError as exc:
+            raise BackupCommittedWithDurabilityWarning(final_path, exc) from exc
+        try:
+            os.fsync(parent_fd)
+        except OSError as exc:
+            raise BackupCommittedWithDurabilityWarning(final_path, exc) from exc
+    except BaseException as exc:
+        primary_error = exc
+        if staging_fd >= 0:
+            fd = staging_fd
+            staging_fd = -1
+            try:
+                os.close(fd)
+            except OSError as cleanup_exc:
+                record_cleanup_failure("closing the staging file", cleanup_exc)
+        if not committed and parent_fd >= 0 and stage_name is not None and staged_identity is not None:
+            try:
+                current = os.stat(stage_name, dir_fd=parent_fd, follow_symlinks=False)
+                same_file = (current.st_dev, current.st_ino) == staged_identity
+                if same_file or stat.S_ISLNK(current.st_mode):
+                    try:
+                        os.unlink(stage_name, dir_fd=parent_fd)
+                    except OSError as cleanup_exc:
+                        record_cleanup_failure("removing the staging file", cleanup_exc)
+            except FileNotFoundError:
+                pass
+            except OSError as cleanup_exc:
+                record_cleanup_failure("checking the staging file", cleanup_exc)
         raise
+    finally:
+        if destination_fd >= 0:
+            fd = destination_fd
+            destination_fd = -1
+            try:
+                os.close(fd)
+            except OSError as cleanup_exc:
+                record_cleanup_failure("closing the destination check", cleanup_exc)
+        if latest_destination_fd >= 0:
+            fd = latest_destination_fd
+            latest_destination_fd = -1
+            try:
+                os.close(fd)
+            except OSError as cleanup_exc:
+                record_cleanup_failure("closing the destination recheck", cleanup_exc)
+        if staging_fd >= 0:
+            fd = staging_fd
+            staging_fd = -1
+            try:
+                os.close(fd)
+            except OSError as cleanup_exc:
+                record_cleanup_failure("closing the staging file", cleanup_exc)
+        if parent_fd >= 0:
+            fd = parent_fd
+            parent_fd = -1
+            try:
+                os.close(fd)
+            except OSError as cleanup_exc:
+                record_cleanup_failure("closing the backup directory", cleanup_exc)
 
 
 def _is_within(path: Path, root: Path) -> bool:
@@ -623,20 +943,35 @@ _RUN_BACKUP_PREFIX = "hermes-backup-"
 
 
 def _resolve_backup_output_path(output: Optional[str]) -> Path:
-    """Turn ``--output`` (file, directory, or None) into a ``.zip`` path whose parent exists;
-    an unwritable path exits with a one-line error, not a traceback."""
+    """Turn ``--output`` (file, directory, or None) into a ``.zip`` path whose parent exists.
+
+    The default is inside the managed, owner-only Hermes backup directory.  A
+    normal home directory is intentionally not tightened just to store one
+    private archive.  An unwritable path exits with a one-line error, not a
+    traceback.
+    """
     out_path = None
     default_name = f"{_RUN_BACKUP_PREFIX}{datetime.now().strftime('%Y-%m-%d-%H%M%S')}.zip"
     try:
         if output:
-            out_path = Path(output).expanduser().resolve()
+            # Keep symlinks visible to the fd-relative staging guard.  ``resolve()`` would turn a
+            # planted output link into its target before the guard can reject it.
+            out_path = Path(os.path.abspath(Path(output).expanduser()))
             if out_path.is_dir():
                 out_path = out_path / default_name
         else:
-            out_path = Path.home() / default_name
+            out_path = get_default_hermes_root() / _PRE_UPDATE_BACKUPS_DIR / default_name
         if out_path.suffix.lower() != ".zip":
             out_path = out_path.with_suffix(out_path.suffix + ".zip")
-        out_path.parent.mkdir(parents=True, exist_ok=True)
+        is_default_output = not output
+        parent_fd = open_trusted_directory(
+            out_path.parent,
+            create=True,
+            owner_only=True,
+            tighten=is_default_output,
+            allow_current_owner_writable=is_default_output,
+        )
+        os.close(parent_fd)
     except OSError as exc:
         print(f"Error: cannot write backup to {output or out_path}: {exc}")
         raise SystemExit(1) from exc
@@ -698,35 +1033,44 @@ def _run_backup_locked(args, hermes_root: Path) -> None:
     logger.info("backup phase=archive status=started files=%d", file_count)
     print(f"Backing up {file_count} files ...")
     errors = []
+    durability_warning = None
     t0 = time.monotonic()
 
     def _progress(i: int) -> None:
         print(f"  {i}/{file_count} files ...")
         logger.info("backup phase=archive status=progress completed=%d total=%d", i, file_count)
 
-    with _atomic_output_path(out_path) as archive_path, zipfile.ZipFile(
-            archive_path, "w", zipfile.ZIP_DEFLATED, compresslevel=6) as zf:
-        total_bytes = _write_zip_entries(
-            zf, files_to_add, out_path, on_progress=_progress, track_bytes=True,
-            on_db_failure=lambda rel: errors.append(f"{rel}: SQLite safe copy failed"),
-            on_error=lambda rel, exc: errors.append(f"{rel}: {exc}"))
-        # External memory-provider state never includes ``.db`` files in practice, so a
-        # straight zf.write is fine.
-        for abs_path, arcname in external_to_add:
-            try:
-                zf.write(abs_path, arcname=arcname)
-                total_bytes += abs_path.stat().st_size
-            except (PermissionError, OSError, ValueError) as exc:
-                errors.append(f"{arcname}: {exc}")
+    try:
+        with _atomic_output_path(out_path) as archive_path, zipfile.ZipFile(
+                archive_path, "w", zipfile.ZIP_DEFLATED, compresslevel=6) as zf:
+            total_bytes = _write_zip_entries(
+                zf, files_to_add, out_path, on_progress=_progress, track_bytes=True,
+                on_db_failure=lambda rel: errors.append(f"{rel}: SQLite safe copy failed"),
+                on_error=lambda rel, exc: errors.append(f"{rel}: {exc}"))
+            # External memory-provider state never includes ``.db`` files in practice, so a
+            # straight zf.write is fine.
+            for abs_path, arcname in external_to_add:
+                try:
+                    zf.write(abs_path, arcname=arcname)
+                    total_bytes += abs_path.stat().st_size
+                except (PermissionError, OSError, ValueError) as exc:
+                    errors.append(f"{arcname}: {exc}")
+    except BackupCommittedWithDurabilityWarning as exc:
+        durability_warning = str(exc)
+        logger.warning("Backup committed with durability warning: %s", exc)
     elapsed = time.monotonic() - t0
     zip_size = out_path.stat().st_size
-    logger.info("backup phase=archive status=complete duration_ms=%.1f files=%d errors=%d bytes=%d",
-                elapsed * 1000, file_count, len(errors), zip_size)
-    print(f"\nBackup {'incomplete' if errors else 'complete'}: {out_path}\n"
+    status = "complete with durability warning" if durability_warning else "incomplete" if errors else "complete"
+    archive_status = "complete_with_durability_warning" if durability_warning else status
+    logger.info("backup phase=archive status=%s duration_ms=%.1f files=%d errors=%d bytes=%d",
+                archive_status, elapsed * 1000, file_count, len(errors), zip_size)
+    print(f"\nBackup {status}: {out_path}\n"
           f"  Files:       {file_count}\n"
           f"  Original:    {_format_size(total_bytes)}\n"
           f"  Compressed:  {_format_size(zip_size)}\n"
           f"  Time:        {elapsed:.1f}s")
+    if durability_warning:
+        print(f"\n  Warning: {durability_warning}")
     if external_to_add:
         print(f"\n  Included {len(external_to_add)} memory-provider file(s) stored outside {display_hermes_home()}.")
     if skipped_external:
@@ -1122,7 +1466,12 @@ def _quick_snapshot_root(hermes_home: Optional[Path] = None) -> Path:
 def create_quick_snapshot(
     label: Optional[str] = None, hermes_home: Optional[Path] = None, keep: Optional[int] = None,
     max_file_size: Optional[int] = None) -> Optional[str]:
-    """Create one atomic quick snapshot while holding the shared backup slot."""
+    """Create one atomic quick snapshot while holding the shared backup slot.
+
+    Raises :class:`QuickSnapshotCommittedWithDurabilityWarning` when publication succeeds but
+    the snapshot-root directory cannot be synced.  The exception carries the published snapshot
+    id so callers can still verify or restore the committed recovery data.
+    """
     home = hermes_home or get_hermes_home()
     with _backup_operation_lock(home):
         return _create_quick_snapshot_locked(label, home, keep, max_file_size)
@@ -1169,7 +1518,10 @@ def _copy_quick_snapshot_files(
                     oversized_skipped.append(rel)
                 continue
         dst = staging_dir / rel
-        dst.parent.mkdir(parents=True, exist_ok=True)
+        parent_fd = open_trusted_directory(
+            dst.parent, create=True, owner_only=True, allow_current_owner_writable=True
+        )
+        os.close(parent_fd)
         try:
             # SQLite DBs go through the WAL-safe backup() path (the gateway may hold the WAL open).
             if src.suffix == ".db":
@@ -1208,6 +1560,103 @@ def _secure_quick_snapshot_tree(root: Path, snapshot_dir: Path) -> None:
             os.chmod(path, 0o600)
 
 
+def _remove_quick_snapshot_tree_contents(directory_fd: int) -> None:
+    """Remove a private staging tree through its already-open directory descriptor.
+
+    The caller owns the staging directory identity.  Every child is opened or unlinked relative
+    to that descriptor and rechecked before removal, so a pathname replacement cannot redirect
+    cleanup outside the staged tree.
+    """
+    directory_flags = os.O_RDONLY | os.O_NOFOLLOW | os.O_DIRECTORY | getattr(os, "O_CLOEXEC", 0)
+    with os.scandir(directory_fd) as entries:
+        for entry in entries:
+            try:
+                before = os.stat(entry.name, dir_fd=directory_fd, follow_symlinks=False)
+            except FileNotFoundError:
+                continue
+            before_identity = (before.st_dev, before.st_ino)
+            if stat.S_ISDIR(before.st_mode):
+                child_fd = -1
+                try:
+                    child_fd = os.open(entry.name, directory_flags, dir_fd=directory_fd)
+                    opened = os.fstat(child_fd)
+                    opened_identity = (opened.st_dev, opened.st_ino)
+                    if (not stat.S_ISDIR(opened.st_mode)
+                            or opened_identity != before_identity):
+                        logger.warning("Preserving replaced quick-snapshot staging directory %s", entry.name)
+                        continue
+                    _remove_quick_snapshot_tree_contents(child_fd)
+                    after = os.stat(entry.name, dir_fd=directory_fd, follow_symlinks=False)
+                    if ((stat.S_ISDIR(after.st_mode)
+                            and (after.st_dev, after.st_ino) == opened_identity)):
+                        os.rmdir(entry.name, dir_fd=directory_fd)
+                    else:
+                        logger.warning("Preserving replaced quick-snapshot staging directory %s", entry.name)
+                except FileNotFoundError:
+                    continue
+                except OSError as exc:
+                    logger.warning("Could not remove quick-snapshot staging directory %s: %s", entry.name, exc)
+                finally:
+                    if child_fd >= 0:
+                        with suppress(OSError):
+                            os.close(child_fd)
+                continue
+            try:
+                after = os.stat(entry.name, dir_fd=directory_fd, follow_symlinks=False)
+                if ((after.st_dev, after.st_ino) == before_identity
+                        and not stat.S_ISDIR(after.st_mode)):
+                    os.unlink(entry.name, dir_fd=directory_fd)
+                else:
+                    logger.warning("Preserving replaced quick-snapshot staging entry %s", entry.name)
+            except FileNotFoundError:
+                continue
+            except OSError as exc:
+                logger.warning("Could not remove quick-snapshot staging entry %s: %s", entry.name, exc)
+
+
+def _remove_quick_snapshot_staging(
+    root_fd: int, stage_name: str, expected_identity: tuple[int, int]
+) -> None:
+    """Remove only our un-published staging directory, anchored to *root_fd*."""
+    try:
+        current = os.stat(stage_name, dir_fd=root_fd, follow_symlinks=False)
+    except FileNotFoundError:
+        return
+    except OSError as exc:
+        logger.warning("Could not inspect quick-snapshot staging entry %s: %s", stage_name, exc)
+        return
+    if (not stat.S_ISDIR(current.st_mode)
+            or (current.st_dev, current.st_ino) != expected_identity):
+        logger.warning("Preserving replaced quick-snapshot staging entry %s", stage_name)
+        return
+
+    directory_flags = os.O_RDONLY | os.O_NOFOLLOW | os.O_DIRECTORY | getattr(os, "O_CLOEXEC", 0)
+    staging_fd = -1
+    try:
+        staging_fd = os.open(stage_name, directory_flags, dir_fd=root_fd)
+        opened = os.fstat(staging_fd)
+        opened_identity = (opened.st_dev, opened.st_ino)
+        if (not stat.S_ISDIR(opened.st_mode)
+                or opened_identity != expected_identity):
+            logger.warning("Preserving replaced quick-snapshot staging entry %s", stage_name)
+            return
+        _remove_quick_snapshot_tree_contents(staging_fd)
+        current = os.stat(stage_name, dir_fd=root_fd, follow_symlinks=False)
+        if (stat.S_ISDIR(current.st_mode)
+                and (current.st_dev, current.st_ino) == opened_identity):
+            os.rmdir(stage_name, dir_fd=root_fd)
+        else:
+            logger.warning("Preserving replaced quick-snapshot staging entry %s", stage_name)
+    except FileNotFoundError:
+        return
+    except OSError as exc:
+        logger.warning("Could not remove quick-snapshot staging directory %s: %s", stage_name, exc)
+    finally:
+        if staging_fd >= 0:
+            with suppress(OSError):
+                os.close(staging_fd)
+
+
 def _create_quick_snapshot_locked(
     label: Optional[str], home: Path, keep: Optional[int], max_file_size: Optional[int]
 ) -> Optional[str]:
@@ -1217,41 +1666,80 @@ def _create_quick_snapshot_locked(
     multi-GB ``state.db`` never stalls ``hermes update`` while the small files are always captured.
     """
     root = _quick_snapshot_root(home)
-    ts = datetime.now(timezone.utc).strftime("%Y%m%d-%H%M%S")
-    base_snap_id = f"{ts}-{label}" if label else ts
-    snap_id, suffix = base_snap_id, 2
-    while (root / snap_id).exists():
-        snap_id = f"{base_snap_id}-{suffix}"
-        suffix += 1
-    staging_dir = root / f".{snap_id}.{os.getpid()}.partial"
-    shutil.rmtree(staging_dir, ignore_errors=True)
-    root.mkdir(parents=True, exist_ok=True, mode=0o700)
-    if os.name != "nt":
-        os.chmod(root, 0o700)
-    staging_dir.mkdir(mode=0o700, exist_ok=False)
-    logger.info("quick snapshot phase=copy status=started id=%s", snap_id)
-    manifest, failed_dbs, oversized_skipped = _copy_quick_snapshot_files(home, staging_dir, max_file_size)
-    if failed_dbs:
-        # Surface on stdout: a log-and-continue made a missing state.db backup look like a
-        # successful pre-update snapshot (#68474).
-        print(f"  ⚠ CRITICAL: could not snapshot DB file(s): {', '.join(failed_dbs)}\n"
-              f"  ⚠ If sessions disappear after the update, check {root}. {_snapshot_recovery_hint()}")
-        logger.error("Quick snapshot failed to capture DB file(s): %s", ", ".join(failed_dbs))
-    if not manifest:
-        shutil.rmtree(staging_dir, ignore_errors=True)
+    root_fd = open_trusted_directory(
+        root,
+        create=True,
+        owner_only=True,
+        tighten=True,
+        allow_current_owner_writable=True,
+    )
+    stage_name: Optional[str] = None
+    staging_identity: Optional[tuple[int, int]] = None
+    published = False
+    try:
+        ts = datetime.now(timezone.utc).strftime("%Y%m%d-%H%M%S")
+        base_snap_id = f"{ts}-{label}" if label else ts
+        snap_id, suffix = base_snap_id, 2
+        while True:
+            try:
+                os.stat(snap_id, dir_fd=root_fd, follow_symlinks=False)
+            except FileNotFoundError:
+                break
+            snap_id = f"{base_snap_id}-{suffix}"
+            suffix += 1
+
+        base_stage_name = f".{snap_id}.{os.getpid()}.partial"
+        for attempt in range(128):
+            stage_name = base_stage_name if attempt == 0 else (
+                f".{snap_id}.{os.getpid()}.{attempt + 1}.partial"
+            )
+            try:
+                os.mkdir(stage_name, 0o700, dir_fd=root_fd)
+            except FileExistsError:
+                continue
+            stage_stat = os.stat(stage_name, dir_fd=root_fd, follow_symlinks=False)
+            if not stat.S_ISDIR(stage_stat.st_mode):
+                raise OSError(f"quick-snapshot staging entry is not a directory: {stage_name}")
+            staging_identity = (stage_stat.st_dev, stage_stat.st_ino)
+            break
+        else:
+            raise OSError("could not allocate a unique quick-snapshot staging name")
+
+        staging_dir = root / stage_name
+        logger.info("quick snapshot phase=copy status=started id=%s", snap_id)
+        manifest, failed_dbs, oversized_skipped = _copy_quick_snapshot_files(
+            home, staging_dir, max_file_size
+        )
         if failed_dbs:
-            # Distinguish "nothing to snapshot" from "state.db present but unreadable"
-            print(f"  ⚠ Snapshot aborted: no files captured (failed DBs: {', '.join(failed_dbs)})")
-        return None
-    meta = {
-        "id": snap_id, "timestamp": ts, "label": label, "file_count": len(manifest),
-        "total_size": sum(manifest.values()), "files": manifest,
-        "failed_dbs": failed_dbs, "oversized_skipped": oversized_skipped,
-    }
-    with open(staging_dir / "manifest.json", "w", encoding="utf-8") as f:
-        json.dump(meta, f, indent=2)
-    _secure_quick_snapshot_tree(root, staging_dir)
-    os.replace(staging_dir, root / snap_id)
+            # Surface on stdout: a log-and-continue made a missing state.db backup look like a
+            # successful pre-update snapshot (#68474).
+            print(f"  ⚠ CRITICAL: could not snapshot DB file(s): {', '.join(failed_dbs)}\n"
+                  f"  ⚠ If sessions disappear after the update, check {root}. {_snapshot_recovery_hint()}")
+            logger.error("Quick snapshot failed to capture DB file(s): %s", ", ".join(failed_dbs))
+        if not manifest:
+            if failed_dbs:
+                # Distinguish "nothing to snapshot" from "state.db present but unreadable"
+                print(f"  ⚠ Snapshot aborted: no files captured (failed DBs: {', '.join(failed_dbs)})")
+            return None
+        meta = {
+            "id": snap_id, "timestamp": ts, "label": label, "file_count": len(manifest),
+            "total_size": sum(manifest.values()), "files": manifest,
+            "failed_dbs": failed_dbs, "oversized_skipped": oversized_skipped,
+        }
+        with open(staging_dir / "manifest.json", "w", encoding="utf-8") as f:
+            json.dump(meta, f, indent=2)
+        _secure_quick_snapshot_tree(root, staging_dir)
+        os.replace(staging_dir.name, snap_id, src_dir_fd=root_fd, dst_dir_fd=root_fd)
+        published = True
+        try:
+            os.fsync(root_fd)
+        except OSError as exc:
+            raise QuickSnapshotCommittedWithDurabilityWarning(root / snap_id, exc) from exc
+    finally:
+        if (not published and stage_name is not None and staging_identity is not None):
+            _remove_quick_snapshot_staging(root_fd, stage_name, staging_identity)
+        with suppress(OSError):
+            os.close(root_fd)
     # Auto-prune (pre-update callers pass a smaller keep so state.db copies don't accumulate).
     # Skip when a DB failed to capture OR was skipped for size (#68805): the snapshot is
     # incomplete and the older one may hold the only recoverable database.
@@ -1438,6 +1926,10 @@ def create_pre_update_snapshots_all_profiles(
                 label="pre-update", hermes_home=profile_home, keep=keep, max_file_size=max_file_size)
             if snap_id:
                 results[name] = snap_id
+        except QuickSnapshotCommittedWithDurabilityWarning as exc:
+            logger.warning("Pre-update snapshot for profile %s committed with durability warning: %s",
+                           name, exc)
+            results[name] = exc.snapshot_id
         except Exception as exc:
             logger.debug("Pre-update snapshot for profile %s failed: %s", name, exc)
     return results
@@ -1596,7 +2088,9 @@ def run_quick_backup(args) -> None:
 
 def _write_full_zip_backup(out_path: Path, hermes_root: Path) -> Optional[Path]:
     """Full zip snapshot of ``hermes_root`` to ``out_path`` under the backup slot (same rules as
-    :func:`run_backup`); None when nothing to back up, another backup running, or write error."""
+    :func:`run_backup`); None when nothing to back up, another backup running, or write error.
+    Raises :class:`BackupCommittedWithDurabilityWarning` when publication succeeded but the
+    containing directory could not be synced."""
     try:
         with _backup_operation_lock(hermes_root):
             return _write_full_zip_backup_locked(out_path, hermes_root)
@@ -1631,6 +2125,9 @@ def _write_full_zip_backup_locked(out_path: Path, hermes_root: Path) -> Optional
                 on_error=lambda rel, exc: logger.debug("Skipping %s in zip backup: %s", rel, exc),
                 on_progress=lambda i: logger.info(
                     "automatic backup phase=archive status=progress completed=%d total=%d", i, len(files_to_add)))
+    except BackupCommittedWithDurabilityWarning as exc:
+        logger.warning("Full-zip backup committed with durability warning: %s", exc)
+        raise
     except (OSError, _SQLiteSnapshotError) as exc:
         # The hidden partial is already gone; ``out_path`` may be a previous valid backup: keep it.
         logger.warning("Full-zip backup: zip write failed: %s", exc)
@@ -1663,13 +2160,21 @@ def _prune_prefixed_zips(backup_dir: Path, prefix: str, keep: int, what: str) ->
 def _create_prefixed_full_backup(
     hermes_home: Optional[Path], prefix: str, keep: int, what: str, prune_what: str) -> Optional[Path]:
     """Write ``<HERMES_HOME>/backups/<prefix><timestamp>.zip`` and prune older same-prefix zips.
-    Returns the path, or ``None`` if nothing to back up or the write failed. Never raises."""
+    Returns the path, or ``None`` if nothing to back up or the write failed. A published archive
+    whose directory sync failed raises :class:`BackupCommittedWithDurabilityWarning`."""
     hermes_root = hermes_home or get_default_hermes_root()
     if not hermes_root.is_dir():
         return None
     backup_dir = hermes_root / _PRE_UPDATE_BACKUPS_DIR
     try:
-        backup_dir.mkdir(parents=True, exist_ok=True)
+        parent_fd = open_trusted_directory(
+            backup_dir,
+            create=True,
+            owner_only=True,
+            tighten=True,
+            allow_current_owner_writable=True,
+        )
+        os.close(parent_fd)
     except OSError as exc:
         logger.warning("Could not create %s backup dir %s: %s", what, backup_dir, exc)
         return None
@@ -1683,7 +2188,8 @@ def _create_prefixed_full_backup(
 def create_pre_update_backup(
     hermes_home: Optional[Path] = None, keep: int = _PRE_UPDATE_DEFAULT_KEEP) -> Optional[Path]:
     """Full zip backup to ``backups/pre-update-<timestamp>.zip``, auto-pruned; ``None`` if nothing
-    was found or the backup failed. Never raises — ``hermes update`` continues anyway."""
+    was found or the backup failed. Raises :class:`BackupCommittedWithDurabilityWarning` when the
+    archive was published but its directory could not be synced."""
     return _create_prefixed_full_backup(hermes_home, _PRE_UPDATE_PREFIX, max(keep, 1), "pre-update", "backup")
 
 
@@ -1691,7 +2197,8 @@ def create_pre_migration_backup(
     hermes_home: Optional[Path] = None, keep: int = _PRE_MIGRATION_DEFAULT_KEEP) -> Optional[Path]:
     """Full zip backup to ``backups/pre-migration-<timestamp>.zip`` before ``hermes claw migrate``
     (same dir as update backups so listings/``hermes import`` find it); ``None`` if nothing was
-    found or the write failed. Never raises."""
+    found or the write failed. Raises :class:`BackupCommittedWithDurabilityWarning` when the
+    archive was published but its directory could not be synced."""
     return _create_prefixed_full_backup(
         hermes_home, _PRE_MIGRATION_PREFIX, max(keep, 0), "pre-migration", "pre-migration backup")
 

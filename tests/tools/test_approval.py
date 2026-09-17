@@ -1845,7 +1845,7 @@ class TestTirithImportErrorFailOpenPolicy:
     When ``tools.tirith_security`` cannot be imported, ``check_all_command_guards``
     must honour the ``security.tirith_fail_open`` config knob:
 
-    * ``tirith_fail_open: true``  (default) → allow, no approval prompt.
+    * ``tirith_fail_open: true``  (explicit opt-in) → allow, no approval prompt.
     * ``tirith_fail_open: false`` → surface a Tirith-style warning through
       the normal approval flow so the command is not silently permitted.
     """
@@ -1881,8 +1881,9 @@ class TestTirithImportErrorFailOpenPolicy:
 
         assert result.get("approved") is True
 
-    def test_fail_open_false_escalates_to_approval_on_import_error(self):
+    def test_fail_open_false_escalates_to_approval_on_import_error(self, monkeypatch):
         """Fail-closed: ImportError must NOT silently allow when tirith_fail_open=false."""
+        monkeypatch.delenv("TIRITH_ENABLED", raising=False)
         import builtins
         from unittest.mock import patch as _patch
         from tools.approval import check_all_command_guards

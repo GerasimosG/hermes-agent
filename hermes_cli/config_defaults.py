@@ -1638,7 +1638,7 @@ DEFAULT_CONFIG = {
         "tirith_enabled": True,
         "tirith_path": "tirith",
         "tirith_timeout": 5,
-        "tirith_fail_open": True,
+        "tirith_fail_open": False,
         "website_blocklist": {"enabled": False, "domains": [], "shared_files": []},
         # IDs of supply-chain advisories the user has read and acted on; acked ones stop the startup
         # banner. Add via `hermes doctor --ack <id>`; remove by editing the list. Catalog:

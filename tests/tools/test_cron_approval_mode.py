@@ -355,6 +355,7 @@ class TestCronDenyModeAllGuards:
         """When tirith is unavailable and security.tirith_fail_open is false,
         cron-deny mode blocks rather than silently allowing (a cron session has
         no user to approve). Mirrors the fail-closed handling in the main flow."""
+        monkeypatch.delenv("TIRITH_ENABLED", raising=False)
         monkeypatch.setenv("HERMES_CRON_SESSION", "1")
         monkeypatch.delenv("HERMES_INTERACTIVE", raising=False)
         monkeypatch.delenv("HERMES_GATEWAY_SESSION", raising=False)
@@ -384,8 +385,9 @@ class TestCronDenyModeAllGuards:
             assert "tirith_fail_open" in result["message"]
 
     def test_tirith_import_error_fail_open_allows_in_cron_deny(self, monkeypatch):
-        """When tirith is unavailable and tirith_fail_open is true (default),
-        cron-deny mode allows safe commands — preserving pre-#22070 behavior."""
+        """When tirith is unavailable and tirith_fail_open is true (explicit opt-in),
+        cron-deny mode allows safe commands."""
+        monkeypatch.delenv("TIRITH_ENABLED", raising=False)
         monkeypatch.setenv("HERMES_CRON_SESSION", "1")
         monkeypatch.delenv("HERMES_INTERACTIVE", raising=False)
         monkeypatch.delenv("HERMES_GATEWAY_SESSION", raising=False)

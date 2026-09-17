@@ -779,13 +779,22 @@ def _verify_state_db_after_snapshot(snapshot_id: str) -> None:
 def _run_quick_snapshots() -> Optional[str]:
     """Quick snapshot of the root home plus every sibling profile; returns the root snapshot id."""
     from hermes_cli.update_cmd import _record_update_step
-    from hermes_cli.backup import create_quick_snapshot
-    snapshot_id = create_quick_snapshot(
-        label="pre-update", keep=_PRE_UPDATE_SNAPSHOT_KEEP, max_file_size=_PRE_UPDATE_SNAPSHOT_MAX_FILE_SIZE,
-    )
+    from hermes_cli.backup import QuickSnapshotCommittedWithDurabilityWarning, create_quick_snapshot
+    durability_warning = None
+    try:
+        snapshot_id = create_quick_snapshot(
+            label="pre-update", keep=_PRE_UPDATE_SNAPSHOT_KEEP,
+            max_file_size=_PRE_UPDATE_SNAPSHOT_MAX_FILE_SIZE,
+        )
+    except QuickSnapshotCommittedWithDurabilityWarning as exc:
+        snapshot_id = exc.snapshot_id
+        durability_warning = str(exc)
+        logger.warning("Pre-update snapshot committed with durability warning: %s", exc)
+        print(f"  ⚠ Pre-update snapshot committed, but directory durability could not be confirmed: {exc.error}")
     if snapshot_id:
         _verify_state_db_after_snapshot(snapshot_id)
-        print(f"◆ Pre-update snapshot: {snapshot_id}")
+        suffix = " (durability warning)" if durability_warning else ""
+        print(f"◆ Pre-update snapshot: {snapshot_id}{suffix}")
 
     # The code swap + fleet restart touch EVERY profile, so each gets the same snapshot
     # under its own state-snapshots/. Best-effort per profile.
