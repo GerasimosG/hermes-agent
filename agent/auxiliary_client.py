@@ -789,6 +789,12 @@ def _task_prefers_fast_model(task: Optional[str]) -> bool:
         _get_auxiliary_task_config(task).get("prefer_fast_model"), default=False)
 
 
+def compression_requires_main_model_only(task: Optional[str]) -> bool:
+    """Return whether compression must stay on the active main provider and model."""
+    return task == "compression" and is_truthy_value(
+        _get_auxiliary_task_config(task).get("main_model_only"), default=False)
+
+
 # Dedicated vision models for direct providers whose main chat model differs.
 _PROVIDER_VISION_MODELS: Dict[str, str] = {"xiaomi": "mimo-v2.5", "zai": "glm-5v-turbo"}
 
@@ -4318,6 +4324,12 @@ def _resolve_auto_route(
     routed = _try_main_provider_route(main_provider, main_model, base_url, api_key, api_mode)
     if routed is not None:
         return routed
+    if compression_requires_main_model_only(task):
+        logger.info(
+            "Auxiliary compression: selected main provider/model unavailable; "
+            "cross-model fallback is disabled by auxiliary.compression.main_model_only"
+        )
+        return None, None, ""
     if task:
         fb_client, fb_model, fb_label = _try_configured_fallback_chain(
             task, main_provider or "auto", reason="main provider unavailable")
@@ -7118,6 +7130,12 @@ def _ladder_provider_fallback(first_err: Exception, route: _LadderRoute):
     # Rate limits are included: after retries are exhausted, a 429 means the provider is at capacity. See
     # #52228. See #26803: daily token quota must fall back like a 402 credit error.
     is_auto = resolved_provider in {"auto", "", None}
+    if compression_requires_main_model_only(task):
+        logger.info(
+            "Auxiliary compression: selected main provider/model failed; "
+            "cross-model fallback is disabled by auxiliary.compression.main_model_only"
+        )
+        return None
     reason = next((label for predicate, label in _FALLBACK_REASONS if predicate(first_err)), None)
     is_capacity_error = any(
         predicate(first_err) for predicate, label in _FALLBACK_REASONS if label != "auth error")

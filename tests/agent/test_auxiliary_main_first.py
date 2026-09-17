@@ -177,7 +177,66 @@ class TestResolveAutoMainFirst:
         mock_main_chain.assert_not_called()
         mock_openrouter.assert_not_called()
 
+    def test_compression_main_model_only_inherits_selected_main_route(self):
+        """Compression auto routing uses the live main provider and model."""
+        main_client = MagicMock()
+        with patch(
+            "agent.auxiliary_client._get_auxiliary_task_config",
+            return_value={"main_model_only": True},
+        ), patch(
+            "agent.auxiliary_client.resolve_provider_client",
+            return_value=(main_client, "gpt-6-astra"),
+        ) as mock_resolve, patch(
+            "agent.auxiliary_client._is_provider_unhealthy", return_value=False
+        ):
+            from agent.auxiliary_client import _resolve_auto_route
 
+            client, model, provider = _resolve_auto_route(
+                main_runtime={
+                    "provider": "openai-codex",
+                    "model": "gpt-6-astra",
+                    "api_mode": "codex_responses",
+                },
+                task="compression",
+            )
+
+        assert client is main_client
+        assert model == "gpt-6-astra"
+        assert provider == "openai-codex"
+        assert mock_resolve.call_args.args[:2] == ("openai-codex", "gpt-6-astra")
+
+    def test_compression_main_model_only_blocks_cross_model_fallback_after_error(self):
+        """A failed selected route must not enter any alternate-model fallback rung."""
+        from agent.auxiliary_client import _LadderRoute, _ladder_provider_fallback
+
+        route = _LadderRoute(
+            client=MagicMock(),
+            task="compression",
+            tag="",
+            async_mode=False,
+            base_info="https://chatgpt.com/backend-api",
+            resolved_provider="auto",
+            resolved_model="gpt-6-astra",
+            resolved_base_url=None,
+            resolved_api_key=None,
+            resolved_api_mode="codex_responses",
+            final_model="gpt-6-astra",
+            main_runtime={"provider": "openai-codex", "model": "gpt-6-astra"},
+            route_info={},
+        )
+
+        with patch(
+            "agent.auxiliary_client._get_auxiliary_task_config",
+            return_value={"main_model_only": True},
+        ), patch(
+            "agent.auxiliary_client._try_configured_fallback_chain"
+        ) as task_chain, patch(
+            "agent.auxiliary_client._try_main_fallback_chain"
+        ) as main_chain:
+            assert list(_ladder_provider_fallback(RuntimeError("connection failed"), route)) == []
+
+        task_chain.assert_not_called()
+        main_chain.assert_not_called()
 
 
     def test_resolve_provider_auto_returns_runtime_model_not_stale_config_default(self):
