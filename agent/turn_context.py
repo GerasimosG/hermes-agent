@@ -660,6 +660,23 @@ def _ensure_session_row(agent: Any, pending_cli_message: Any) -> None:
     )
 
 
+def hook_tool_catalog(agent: Any) -> list[dict[str, str]]:
+    """Expose bounded metadata for the tools already visible to pre-LLM plugins."""
+    catalog: list[dict[str, str]] = []
+    for schema in getattr(agent, "tools", []) or []:
+        if not isinstance(schema, dict):
+            continue
+        function = schema.get("function")
+        if not isinstance(function, dict):
+            continue
+        name = str(function.get("name") or "").strip()
+        if not name:
+            continue
+        description = str(function.get("description") or "").strip()
+        catalog.append({"name": name, "description": description[:400]})
+    return catalog[:256]
+
+
 def _collect_pre_llm_call_context(
     agent: Any, *, effective_task_id: str, turn_id: str, original_user_message: Any,
     messages: List[Any], conversation_history: Optional[List[Any]],
@@ -683,6 +700,7 @@ def _collect_pre_llm_call_context(
             platform=getattr(agent, "platform", None) or "",
             parent_session_id=getattr(agent, "_parent_session_id", None) or "",
             sender_id=getattr(agent, "_user_id", None) or "",
+            available_tools=hook_tool_catalog(agent),
         )
         try:
             # Spill oversized per-hook context to disk so a runaway plugin can't inflate every subsequent

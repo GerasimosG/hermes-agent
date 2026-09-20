@@ -18,6 +18,10 @@ def _agent(*, persist_disabled: bool):
         model="test/model",
         platform="cli",
         session_id="shared-session",
+        tools=[{
+            "type": "function",
+            "function": {"name": "terminal", "description": "Run commands"},
+        }],
         _build_system_prompt=Mock(return_value="system prompt"),
     )
 
@@ -100,6 +104,10 @@ def test_persisted_agent_still_fires_session_and_turn_lifecycle_hooks():
     assert [call.args[0] for call in lifecycle_hook.call_args_list] == [
         "on_session_start",
         "pre_llm_call",
+    ]
+    pre_llm_call = lifecycle_hook.call_args_list[1]
+    assert pre_llm_call.kwargs["available_tools"] == [
+        {"name": "terminal", "description": "Run commands"}
     ]
     assert context == "plugin context"
     assert output_calls == ["transform_llm_output", "post_llm_call"]
