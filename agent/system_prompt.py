@@ -282,11 +282,14 @@ def _tool_guidance_block(agent: Any) -> Optional[str]:
             getattr(agent, "_user_profile_enabled", True),
             skill_manage_available="skill_manage" in names,
         )
-    # Kanban lifecycle: resolved once at __init__ (_kanban_worker_guidance);
-    # the kanban_show fallback covers code paths that bypass agent_init.
+    # Kanban lifecycle: resolved once at __init__ (_kanban_worker_guidance).
+    # The fallback covers code paths that bypass agent_init, but remains worker-only:
+    # a visible kanban_show tool does not make a Telegram/CLI session a worker.
     _kanban_guidance = getattr(agent, "_kanban_worker_guidance", None)
     if _kanban_guidance is None and "kanban_show" in names:
-        _kanban_guidance = KANBAN_GUIDANCE
+        from agent.delegation_context import is_kanban_worker_context
+        if is_kanban_worker_context():
+            _kanban_guidance = KANBAN_GUIDANCE
     tool_guidance = [
         memory_guidance,
         SESSION_SEARCH_GUIDANCE if "session_search" in names else None,

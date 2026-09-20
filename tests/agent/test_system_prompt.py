@@ -57,6 +57,43 @@ def _captured_context_cwd(agent):
     return captured["cwd"]
 
 
+def test_kanban_worker_guidance_requires_dispatcher_task(monkeypatch):
+    """A visible Kanban tool does not make an ordinary chat a worker."""
+    from agent.prompt_builder import KANBAN_GUIDANCE
+    from agent.system_prompt import _tool_guidance_block
+
+    monkeypatch.delenv("HERMES_KANBAN_TASK", raising=False)
+    agent = _make_agent(valid_tool_names={"kanban_show"}, _kanban_worker_guidance=None)
+
+    assert KANBAN_GUIDANCE not in (_tool_guidance_block(agent) or "")
+
+
+def test_kanban_worker_guidance_is_available_for_dispatcher_task(monkeypatch):
+    """A dispatcher-owned task still receives the worker lifecycle protocol."""
+    from agent.prompt_builder import KANBAN_GUIDANCE
+    from agent.system_prompt import _tool_guidance_block
+
+    monkeypatch.setenv("HERMES_KANBAN_TASK", "task-regression")
+    agent = _make_agent(valid_tool_names={"kanban_show"}, _kanban_worker_guidance=None)
+
+    assert KANBAN_GUIDANCE in (_tool_guidance_block(agent) or "")
+
+
+@pytest.mark.parametrize("task_id", [None, ""])
+def test_kanban_worker_guidance_does_not_use_empty_task_id(monkeypatch, task_id):
+    """An empty environment value is not a dispatcher task."""
+    from agent.prompt_builder import KANBAN_GUIDANCE
+    from agent.system_prompt import _tool_guidance_block
+
+    if task_id is None:
+        monkeypatch.delenv("HERMES_KANBAN_TASK", raising=False)
+    else:
+        monkeypatch.setenv("HERMES_KANBAN_TASK", task_id)
+    agent = _make_agent(valid_tool_names={"kanban_show"}, _kanban_worker_guidance=None)
+
+    assert KANBAN_GUIDANCE not in (_tool_guidance_block(agent) or "")
+
+
 @pytest.mark.parametrize("stores", [(True, True), (False, True), (True, False), (False, False)])
 @pytest.mark.parametrize("names", [
     set(), {"memory"}, {"memory", "skill_view", "skills_list"},

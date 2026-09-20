@@ -62,6 +62,9 @@ zero outside a kanban task (footprint ladder rung 3).
   the full set plus `kanban_list`/`kanban_unblock` for board routing. The check_fn reads the schema
   build's own selection (`tools/kanban_toolset_context.py`), never the legacy top-level `toolsets`
   key alone.
+- **Worker prompt scope:** `KANBAN_GUIDANCE` is worker-only. Gate it with
+  `is_kanban_worker_context()` so a visible `kanban_show` tool does not inject worker instructions
+  into an ordinary Telegram/CLI orchestrator session.
 - **Dispatcher:** long-lived loop (default 60s) that reclaims stale claims, promotes ready tasks,
   atomically claims, and spawns assigned profiles. Runs **inside the gateway** by default
   (`kanban.dispatch_in_gateway: true`). Standalone: `plugins/kanban/systemd/hermes-kanban-dispatcher.service`.

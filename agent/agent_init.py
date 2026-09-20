@@ -1068,10 +1068,15 @@ def _load_tools(agent, enabled_toolsets, disabled_toolsets):
     )
 
     agent.valid_tool_names = {tool["function"]["name"] for tool in agent.tools} if agent.tools else set()
-    # Kanban guidance is session-static (kanban_show iff HERMES_KANBAN_TASK); resolve once.
+    # Worker guidance is session-static, but visibility of kanban_show is not enough:
+    # Telegram/CLI orchestrator sessions may expose the tool without owning a task.
+    # Only a dispatcher-owned task gets the worker lifecycle protocol.
+    from agent.delegation_context import is_kanban_worker_context
     from agent.prompt_builder import KANBAN_GUIDANCE
     agent._kanban_worker_guidance = (
-        KANBAN_GUIDANCE if "kanban_show" in agent.valid_tool_names else ""
+        KANBAN_GUIDANCE
+        if (is_kanban_worker_context() and "kanban_show" in agent.valid_tool_names)
+        else ""
     )
     if agent.quiet_mode:
         return

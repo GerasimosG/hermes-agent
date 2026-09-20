@@ -73,6 +73,15 @@ def is_dispatcher_owned_worker_context() -> bool:
     return not (is_delegated_child_process_context() or _NON_DISPATCHER_OWNED_CONTEXT.get())
 
 
+def is_kanban_worker_context() -> bool:
+    """Return True only for a dispatcher-owned run carrying a task identity.
+
+    Tool visibility alone is insufficient: orchestrator and normal Telegram/CLI
+    sessions may expose Kanban tools without being assigned a board task.
+    """
+    return bool(os.environ.get("HERMES_KANBAN_TASK")) and is_dispatcher_owned_worker_context()
+
+
 def is_delegated_child_process_context() -> bool:
     """Return True in this process or a subprocess spawned by a child."""
     return bool(_DELEGATED_CHILD_CONTEXT.get()) or bool(os.environ.get(DELEGATED_CHILD_ENV_MARKER))
