@@ -3,6 +3,7 @@
 import hashlib
 import os
 from pathlib import Path
+import shutil
 import sqlite3
 import subprocess
 import sys
@@ -67,3 +68,19 @@ def test_backup_failure_preserves_previous_verified_file(backup, tmp_path):
     for result in (run(minimum=2), run(path=str(tmp_path / "no-sqlite"))):
         assert result.returncode != 0
         assert hashlib.sha256(target.read_bytes()).digest() == previous
+
+
+def test_insufficient_space_preserves_previous_backup(backup):
+    source, target, run = backup
+    with sqlite3.connect(source) as writer:
+        writer.execute("CREATE TABLE messages(id INTEGER PRIMARY KEY)")
+        writer.execute("INSERT INTO messages VALUES (42)")
+    assert run().returncode == 0
+    previous = target.read_bytes()
+    # A sparse file exercises the real size check without consuming the test volume.
+    with source.open("r+b") as stream:
+        stream.truncate(shutil.disk_usage(source.parent).free + 1)
+    result = run()
+    assert result.returncode != 0
+    assert "Insufficient destination space" in result.stderr
+    assert target.read_bytes() == previous

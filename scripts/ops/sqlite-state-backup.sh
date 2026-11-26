@@ -19,11 +19,34 @@ minimum_messages=$3
 sqlite=$(command -v sqlite3) || fail "sqlite3 is required for a consistent live snapshot"
 command -v python3 >/dev/null || fail "python3 is required to verify the candidate"
 command -v flock >/dev/null || fail "flock is required to prevent overlapping backups"
+command -v timeout >/dev/null || fail "timeout is required to bound the snapshot attempt"
 
 parent=$(dirname -- "$destination")
 [[ -d "$parent" ]] || fail "The backup destination directory does not exist"
 exec 9>"${destination}.backup.lock"
 flock -n 9 || fail "Another backup already holds the destination lock"
+
+if ! python3 - "$source_db" "$parent" <<'PY'
+from pathlib import Path
+import shutil
+import sys
+
+source = Path(sys.argv[1])
+# Reserve the current database and WAL sizes and space for publication metadata.
+wal = source.with_name(source.name + "-wal")
+try:
+    wal_bytes = wal.stat().st_size
+except FileNotFoundError:
+    wal_bytes = 0
+required = source.stat().st_size + wal_bytes + 64 * 1024**2
+available = shutil.disk_usage(sys.argv[2]).free
+if available < required:
+    sys.exit(f"Insufficient destination space: {available} bytes available, {required} required")
+PY
+then
+    fail "Backup storage check failed. Previous backup retained"
+fi
+
 staging=$(mktemp -d -- "$parent/.sqlite-backup.XXXXXXXX")
 trap 'rm -rf -- "$staging"' EXIT
 candidate="$staging/state.db"
